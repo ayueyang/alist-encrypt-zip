@@ -95,7 +95,7 @@ encNameRouter.put('/api/fs/put', async (ctx, next) => {
     }
     const originalName = path.basename(uploadPath)
     if (isZipEncType(passwdInfo.encType)) {
-      const packageSize = ZipPackageEnc.packageSize(request.fileSize, { originalName, zipMode: passwdInfo.zipMode })
+      const packageSize = ZipPackageEnc.packageSize(request.fileSize, { originalName, zipMode: passwdInfo.zipMode, password: passwdInfo.password })
       headers['content-length'] = String(packageSize)
       delete headers['x-expected-entity-length']
       logger.info('@@zip upload package', {

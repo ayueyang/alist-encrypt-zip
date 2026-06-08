@@ -48,7 +48,7 @@ function setUploadPackageSize(request, passwdInfo, plainSize, originalName) {
   if (!isZipEncType(passwdInfo.encType)) {
     return
   }
-  const packageSize = ZipPackageEnc.packageSize(plainSize, { originalName, zipMode: passwdInfo.zipMode })
+  const packageSize = ZipPackageEnc.packageSize(plainSize, { originalName, zipMode: passwdInfo.zipMode, password: passwdInfo.password })
   request.zipPlainSize = plainSize
   request.zipPackageSize = packageSize
   request.headers['content-length'] = String(packageSize)
@@ -61,6 +61,7 @@ function serializeZipInfo(zipInfo) {
     ...zipInfo,
     salt: zipInfo.salt ? Buffer.from(zipInfo.salt).toString('hex') : undefined,
     nonce: zipInfo.nonce ? Buffer.from(zipInfo.nonce).toString('hex') : undefined,
+    meta: zipInfo.meta ? Buffer.from(zipInfo.meta).toString('hex') : undefined,
   }
 }
 
@@ -70,6 +71,7 @@ function deserializeZipInfo(zipInfo) {
     ...zipInfo,
     salt: zipInfo.salt ? Buffer.from(zipInfo.salt, 'hex') : undefined,
     nonce: zipInfo.nonce ? Buffer.from(zipInfo.nonce, 'hex') : undefined,
+    meta: zipInfo.meta ? Buffer.from(zipInfo.meta, 'hex') : undefined,
   }
 }
 
@@ -88,7 +90,7 @@ function getZipCacheHeaders(headers, urlAddr) {
 }
 
 async function prepareZipDecrypt(request, passwdInfo, sourceSize, rangeHeader, cachedZipInfo = null) {
-  const zipInfo = cachedZipInfo || (await parseZipInfoFromRemote(request.urlAddr, request.headers, sourceSize))
+  const zipInfo = cachedZipInfo || (await parseZipInfoFromRemote(request.urlAddr, request.headers, sourceSize, { password: passwdInfo.password }))
   request.zipVirtualName = request.zipVirtualName || path.basename(decodeURIComponent(request.url.split('?')[0] || zipInfo.innerName))
   prepareZipDownloadRequest(request, zipInfo, rangeHeader)
   const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, zipInfo.plainSize, { zipInfo })
@@ -343,7 +345,7 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     let zipInfo = null
     let zipCacheId = null
     if (isZipEncType(passwdInfo.encType)) {
-      zipInfo = await parseZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize)
+      zipInfo = await parseZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize, { password: passwdInfo.password })
       result.data.size = zipInfo.plainSize
       zipCacheId = zipCacheKey({ virtualPath, redirectUrl: result.data.raw_url, fileSize: remoteFileSize, passwdInfo })
       startZipCacheDownload(

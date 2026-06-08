@@ -2,13 +2,14 @@
 
 ## ZIP 加密说明
 
-本分支新增 `zip` 加密方式，适合希望网盘里保存为 `.zip` 压缩包，同时又能通过 alist-encrypt 在线播放的场景。设置页里会直接显示两种 ZIP 算法：
+本分支新增 `zip` 加密方式，适合希望网盘里保存为 `.zip` 压缩包，同时又能通过 alist-encrypt 在线播放的场景。设置页里会直接显示三种 ZIP 算法：
 
-- **真ZIP**：配置值是 `encType: "zip"`、`zipMode: "compatible"`，也是默认模式。它会生成真正的标准 ZIP 包，使用 ZipCrypto + store 存储方式。7-Zip、WinRAR、RAR、Bandizip 等常规 ZIP/RAR/7z 解压软件都可以直接打开这个 `.zip`，输入同一个密码后解压出内容正常、可播放的视频文件。
+- **真ZIP(ZipCrypto)**：配置值是 `encType: "zip"`、`zipMode: "compatible"`，也是默认模式。它会生成真正的标准 ZIP 包，使用 ZipCrypto + store 存储方式。7-Zip、WinRAR、RAR、Bandizip 等常规 ZIP/RAR/7z 解压软件都可以直接打开这个 `.zip`，输入同一个密码后解压出内容正常、可播放的视频文件。
+- **WinZip AES**：配置值是 `encType: "zip"`、`zipMode: "winzip-aes"`。它会生成标准 WinZip AES-256 ZIP，普通解压软件输入密码后也能解压出正常可播放的视频文件；ZIP 内部文件名使用 `payload.原后缀`，真实原文件名会加密写入自定义 extra field，代理可恢复显示，普通解压软件不会看到真实标题。
 - **伪装ZIP**：配置值是 `encType: "zip"`、`zipMode: "fake"`。它只做 ZIP 外壳，里面继续使用 alist-encrypt 的流加密，适合强度优先和代理在线播放；普通解压软件可以看到它像 ZIP，但不能直接解密出可播放文件。
 - 开启文件名加密后，原始 AList/网盘里看到的是加密后的 `密文.原后缀.zip`，例如 `abc123.mp4.zip`；通过 alist-encrypt 代理访问时显示原文件名，例如 `电影名.mp4`。
-- ZIP 内部不会保存明文原文件名，解压出来的文件名可能是通用名或密文名，但真ZIP解压出来的文件内容是解密后的正常视频。
-- 真ZIP为了兼容普通解压软件使用 ZipCrypto，兼容性强但加密强度弱于现代 AES；需要更强加密时建议使用伪装ZIP。
+- ZIP 内部不会保存明文原文件名，解压出来的文件名可能是 `payload.mp4`、通用名或密文名，但真ZIP和WinZip AES解压出来的文件内容是解密后的正常视频。
+- 真ZIP(ZipCrypto)兼容性强但加密强度弱；需要兼顾常规解压和更强加密时建议使用 WinZip AES。Windows 自带解压不一定支持 AES ZIP，推荐使用 7-Zip、WinRAR、Bandizip 或 WinZip。
 
 这个项目主要是对 alist 的服务进行代理，提供 webdav 的加解密功能。支持 alist 网页在线播放加密的视频，查看加密的图片等功能，同时在 webdav 下的操作透明，自动实现文件资源的加解密。
 

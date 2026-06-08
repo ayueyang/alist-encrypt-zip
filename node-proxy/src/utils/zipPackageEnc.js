@@ -8,17 +8,29 @@ import { Transform } from 'stream'
 export const ZIP_ENC_TYPE = 'zip'
 export const ZIP_MODE_FAKE = 'fake'
 export const ZIP_MODE_COMPATIBLE = 'compatible'
+export const ZIP_MODE_WINZIP_AES = 'winzip-aes'
 
 const INNER_FILENAME = 'payload.bin'
 const CUSTOM_EXTRA_ID = 0x5a46 // "FZ" in little endian
 const ZIP64_EXTRA_ID = 0x0001
+const WINZIP_AES_EXTRA_ID = 0x9901
 const MODE_FAKE_AES_CTR = 0
 const MODE_COMPATIBLE_ZIPCRYPTO = 1
+const MODE_WINZIP_AES = 2
 const VERSION = 1
 const SALT_SIZE = 16
 const NONCE_SIZE = 16
 const KEY_SIZE = 32
 const PBKDF2_ITERATIONS = 100000
+const WINZIP_AES_SALT_SIZE = 16
+const WINZIP_AES_VERIFY_SIZE = 2
+const WINZIP_AES_AUTH_SIZE = 10
+const WINZIP_AES_KEY_SIZE = 32
+const WINZIP_AES_STRENGTH = 3
+const WINZIP_AES_VENDOR = Buffer.from('AE', 'ascii')
+const WINZIP_AES_VERSION = 2
+const WINZIP_AES_METHOD = 99
+const WINZIP_AES_PBKDF2_ITERATIONS = 1000
 const ZIP32_MAX = 0xffffffff
 const ZIPCRYPTO_HEADER_SIZE = 12
 const CHECKPOINT_LIMIT = 4000
@@ -27,6 +39,7 @@ const FIXED_DOS_TIME = 0x4800
 const FIXED_DOS_DATE = 0x5a2a
 const ZIP_FLAGS = 0x0001 | 0x0008
 const STORE_METHOD = 0
+const DEFAULT_META_KEY = Buffer.from('ZIPMETA1', 'ascii')
 
 const MIME_MAP = {
   '.mp4': 'video/mp4',
@@ -157,11 +170,16 @@ function getInnerName(name) {
 }
 
 function normalizeZipMode(mode) {
-  return mode === ZIP_MODE_FAKE || mode === MODE_FAKE_AES_CTR ? ZIP_MODE_FAKE : ZIP_MODE_COMPATIBLE
+  if (mode === ZIP_MODE_FAKE || mode === MODE_FAKE_AES_CTR) return ZIP_MODE_FAKE
+  if (mode === ZIP_MODE_WINZIP_AES || mode === MODE_WINZIP_AES) return ZIP_MODE_WINZIP_AES
+  return ZIP_MODE_COMPATIBLE
 }
 
 function modeNumber(zipMode) {
-  return normalizeZipMode(zipMode) === ZIP_MODE_FAKE ? MODE_FAKE_AES_CTR : MODE_COMPATIBLE_ZIPCRYPTO
+  const normalizedMode = normalizeZipMode(zipMode)
+  if (normalizedMode === ZIP_MODE_FAKE) return MODE_FAKE_AES_CTR
+  if (normalizedMode === ZIP_MODE_WINZIP_AES) return MODE_WINZIP_AES
+  return MODE_COMPATIBLE_ZIPCRYPTO
 }
 
 function deriveOutwardPassword(password) {
@@ -173,6 +191,21 @@ function deriveOutwardPassword(password) {
 
 function deriveKey(password, salt) {
   return crypto.pbkdf2Sync(password, salt, PBKDF2_ITERATIONS, KEY_SIZE, 'sha256')
+}
+
+function deriveWinZipAesKeys(password, salt) {
+  const material = crypto.pbkdf2Sync(
+    Buffer.from(String(password), 'utf8'),
+    salt,
+    WINZIP_AES_PBKDF2_ITERATIONS,
+    WINZIP_AES_KEY_SIZE * 2 + WINZIP_AES_VERIFY_SIZE,
+    'sha1'
+  )
+  return {
+    encKey: material.subarray(0, WINZIP_AES_KEY_SIZE),
+    macKey: material.subarray(WINZIP_AES_KEY_SIZE, WINZIP_AES_KEY_SIZE * 2),
+    verifier: material.subarray(WINZIP_AES_KEY_SIZE * 2),
+  }
 }
 
 function incrementIV(iv, increment) {
@@ -202,6 +235,100 @@ function createCtrCipher(key, nonce, position) {
     cipher.update(Buffer.alloc(offset))
   }
   return cipher
+}
+
+function incrementLittleEndianCounter(counter) {
+  for (let i = 0; i < counter.length; i++) {
+    counter[i] = (counter[i] + 1) & 0xff
+    if (counter[i] !== 0) break
+  }
+}
+
+function createWinZipAesCtr(key, position = 0) {
+  const blockIndex = Math.trunc(Number(position || 0) / 16)
+  let offset = 16
+  let initialOffset = Math.trunc(Number(position || 0) % 16)
+  const counter = Buffer.alloc(16)
+  counter.writeBigUInt64LE(BigInt(blockIndex + 1), 0)
+  const ecb = crypto.createCipheriv('aes-256-ecb', key, null)
+  ecb.setAutoPadding(false)
+  let keystream = Buffer.alloc(0)
+
+  function nextKeyByte() {
+    if (offset >= keystream.length) {
+      keystream = ecb.update(counter)
+      incrementLittleEndianCounter(counter)
+      offset = initialOffset
+      initialOffset = 0
+    }
+    return keystream[offset++]
+  }
+
+  return {
+    update(data) {
+      const output = Buffer.alloc(data.length)
+      for (let i = 0; i < data.length; i++) {
+        output[i] = data[i] ^ nextKeyByte()
+      }
+      return output
+    },
+    final() {
+      ecb.final()
+      return Buffer.alloc(0)
+    },
+  }
+}
+
+function metaPlainBuffer(originalName, innerName, zipMode) {
+  return Buffer.from(
+    JSON.stringify({
+      origName: normalizeName(originalName),
+      innerName: normalizeName(innerName),
+      zipMode: normalizeZipMode(zipMode),
+    }),
+    'utf8'
+  )
+}
+
+function encryptedMetaLength(originalName, innerName, zipMode) {
+  return 4 + 16 + 12 + 16 + metaPlainBuffer(originalName, innerName, zipMode).length
+}
+
+function buildEncryptedMeta(password, originalName, innerName, zipMode) {
+  if (!password) {
+    return Buffer.alloc(encryptedMetaLength(originalName, innerName, zipMode))
+  }
+  const plain = metaPlainBuffer(originalName, innerName, zipMode)
+  const salt = crypto.randomBytes(16)
+  const nonce = crypto.randomBytes(12)
+  const key = crypto.pbkdf2Sync(String(password || ''), salt, 1000, 32, 'sha256')
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce)
+  cipher.setAAD(DEFAULT_META_KEY)
+  const ciphertext = Buffer.concat([cipher.update(plain), cipher.final()])
+  const tag = cipher.getAuthTag()
+  return Buffer.concat([Buffer.from([1, salt.length, nonce.length, tag.length]), salt, nonce, tag, ciphertext])
+}
+
+function decryptMeta(password, meta) {
+  if (!meta || meta.length < 4 || meta[0] !== 1) return null
+  const saltLen = meta[1]
+  const nonceLen = meta[2]
+  const tagLen = meta[3]
+  const dataStart = 4 + saltLen + nonceLen + tagLen
+  if (dataStart > meta.length) return null
+  try {
+    const salt = meta.subarray(4, 4 + saltLen)
+    const nonce = meta.subarray(4 + saltLen, 4 + saltLen + nonceLen)
+    const tag = meta.subarray(4 + saltLen + nonceLen, dataStart)
+    const ciphertext = meta.subarray(dataStart)
+    const key = crypto.pbkdf2Sync(String(password || ''), salt, 1000, 32, 'sha256')
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce)
+    decipher.setAAD(DEFAULT_META_KEY)
+    decipher.setAuthTag(tag)
+    return JSON.parse(Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8'))
+  } catch (e) {
+    return null
+  }
 }
 
 function checkpointLayout(plainSize) {
@@ -267,6 +394,8 @@ function buildCustomExtra({ zipMode, salt, nonce, meta = Buffer.alloc(0), checkp
   bodyParts[0].writeUInt16LE(bodyParts[1].length, 4)
   if (normalizedMode === ZIP_MODE_FAKE) {
     bodyParts.push(salt, nonce)
+  } else if (normalizedMode === ZIP_MODE_WINZIP_AES) {
+    bodyParts.push(Buffer.isBuffer(salt) ? salt : Buffer.alloc(WINZIP_AES_SALT_SIZE))
   } else {
     bodyParts.push(checkpoints)
   }
@@ -277,6 +406,30 @@ function buildCustomExtra({ zipMode, salt, nonce, meta = Buffer.alloc(0), checkp
   field.writeUInt16LE(body.length, 2)
   body.copy(field, 4)
   return field
+}
+
+function buildWinZipAesExtra() {
+  const body = Buffer.alloc(7)
+  body.writeUInt16LE(WINZIP_AES_VERSION, 0)
+  WINZIP_AES_VENDOR.copy(body, 2)
+  body.writeUInt8(WINZIP_AES_STRENGTH, 4)
+  body.writeUInt16LE(STORE_METHOD, 5)
+  const field = Buffer.alloc(4 + body.length)
+  field.writeUInt16LE(WINZIP_AES_EXTRA_ID, 0)
+  field.writeUInt16LE(body.length, 2)
+  body.copy(field, 4)
+  return field
+}
+
+function parseWinZipAesExtra(extra) {
+  const field = parseExtraFields(extra).find((item) => item.id === WINZIP_AES_EXTRA_ID)
+  if (!field || field.data.length !== 7) return null
+  return {
+    version: field.data.readUInt16LE(0),
+    vendor: field.data.subarray(2, 4).toString('ascii'),
+    strength: field.data.readUInt8(4),
+    actualMethod: field.data.readUInt16LE(5),
+  }
 }
 
 function buildZip64Extra(values) {
@@ -333,6 +486,16 @@ function parseCustomBody(data, raw = false) {
         ...parseCheckpoints(payload),
       }
     }
+    if (mode === MODE_WINZIP_AES && payload.length >= WINZIP_AES_SALT_SIZE) {
+      return {
+        version: 0,
+        mode,
+        zipMode: ZIP_MODE_WINZIP_AES,
+        origName: data.subarray(6, 6 + metaLen).toString('utf8') || null,
+        salt: payload.subarray(0, WINZIP_AES_SALT_SIZE),
+        checkpoints: [],
+      }
+    }
     return null
   }
 
@@ -363,6 +526,17 @@ function parseCustomBody(data, raw = false) {
       meta,
       origName: meta.length ? meta.toString('utf8') : null,
       ...parseCheckpoints(payload),
+    }
+  }
+  if (mode === MODE_WINZIP_AES && payload.length >= WINZIP_AES_SALT_SIZE) {
+    return {
+      version,
+      mode,
+      zipMode: ZIP_MODE_WINZIP_AES,
+      meta,
+      origName: null,
+      salt: payload.subarray(0, WINZIP_AES_SALT_SIZE),
+      checkpoints: [],
     }
   }
   return null
@@ -404,7 +578,7 @@ function parseZip64Sizes(extra, need) {
   return result
 }
 
-function buildLocalHeader({ plainSize, compressedSize, innerName, customExtra }) {
+function buildLocalHeader({ plainSize, compressedSize, innerName, customExtra, method = STORE_METHOD, crc = 0, flags = ZIP_FLAGS }) {
   const fileName = Buffer.from(innerName || INNER_FILENAME, 'utf8')
   const zip64 = isZip64Needed(plainSize, compressedSize)
   const extra = zip64
@@ -413,11 +587,11 @@ function buildLocalHeader({ plainSize, compressedSize, innerName, customExtra })
   const header = Buffer.alloc(30)
   header.writeUInt32LE(0x04034b50, 0)
   header.writeUInt16LE(zip64 ? 45 : 20, 4)
-  header.writeUInt16LE(ZIP_FLAGS, 6)
-  header.writeUInt16LE(STORE_METHOD, 8)
+  header.writeUInt16LE(flags, 6)
+  header.writeUInt16LE(method, 8)
   header.writeUInt16LE(FIXED_DOS_TIME, 10)
   header.writeUInt16LE(FIXED_DOS_DATE, 12)
-  header.writeUInt32LE(0, 14)
+  header.writeUInt32LE(crc >>> 0, 14)
   header.writeUInt32LE(zip64 ? ZIP32_MAX : 0, 18)
   header.writeUInt32LE(zip64 ? ZIP32_MAX : 0, 22)
   header.writeUInt16LE(fileName.length, 26)
@@ -440,7 +614,7 @@ function buildDataDescriptor({ crc, plainSize, compressedSize }) {
   return descriptor
 }
 
-function buildCentralDirectory({ crc, plainSize, compressedSize, innerName, customExtra, localHeaderOffset, centralOffset }) {
+function buildCentralDirectory({ crc, plainSize, compressedSize, innerName, customExtra, localHeaderOffset, centralOffset, method = STORE_METHOD, flags = ZIP_FLAGS }) {
   const fileName = Buffer.from(innerName || INNER_FILENAME, 'utf8')
   const zip64 = isZip64Needed(plainSize, compressedSize, localHeaderOffset, centralOffset)
   const extra = zip64
@@ -457,8 +631,8 @@ function buildCentralDirectory({ crc, plainSize, compressedSize, innerName, cust
   header.writeUInt32LE(0x02014b50, 0)
   header.writeUInt16LE(zip64 ? 45 : 20, 4)
   header.writeUInt16LE(zip64 ? 45 : 20, 6)
-  header.writeUInt16LE(ZIP_FLAGS, 8)
-  header.writeUInt16LE(STORE_METHOD, 10)
+  header.writeUInt16LE(flags, 8)
+  header.writeUInt16LE(method, 10)
   header.writeUInt16LE(FIXED_DOS_TIME, 12)
   header.writeUInt16LE(FIXED_DOS_DATE, 14)
   header.writeUInt32LE(crc >>> 0, 16)
@@ -512,7 +686,7 @@ function buildEndRecords({ centralOffset, centralSize, zip64 }) {
   return Buffer.concat(records)
 }
 
-function buildTail({ crc, plainSize, compressedSize, innerName, customExtra, headerSize }) {
+function buildTail({ crc, plainSize, compressedSize, innerName, customExtra, headerSize, method = STORE_METHOD, flags = ZIP_FLAGS }) {
   const descriptor = buildDataDescriptor({ crc, plainSize, compressedSize })
   const centralOffset = headerSize + compressedSize + descriptor.length
   const central = buildCentralDirectory({
@@ -523,41 +697,65 @@ function buildTail({ crc, plainSize, compressedSize, innerName, customExtra, hea
     customExtra,
     localHeaderOffset: 0,
     centralOffset,
+    method,
+    flags,
   })
   const zip64 = isZip64Needed(plainSize, compressedSize, centralOffset, central.length)
   const endRecords = buildEndRecords({ centralOffset, centralSize: central.length, zip64 })
   return Buffer.concat([descriptor, central, endRecords])
 }
 
-function buildPackageLayout({ plainSize, originalName = INNER_FILENAME, innerName, zipMode = ZIP_MODE_COMPATIBLE, salt, nonce }) {
+function buildPackageLayout({ plainSize, originalName = INNER_FILENAME, innerName, zipMode = ZIP_MODE_COMPATIBLE, salt, nonce, password = '' }) {
   const normalizedMode = normalizeZipMode(zipMode)
   const zipInnerName = innerName || getInnerName(originalName)
-  const compressedSize = plainSize + (normalizedMode === ZIP_MODE_COMPATIBLE ? ZIPCRYPTO_HEADER_SIZE : 0)
+  const compressedSize =
+    plainSize +
+    (normalizedMode === ZIP_MODE_COMPATIBLE ? ZIPCRYPTO_HEADER_SIZE : 0) +
+    (normalizedMode === ZIP_MODE_WINZIP_AES ? WINZIP_AES_SALT_SIZE + WINZIP_AES_VERIFY_SIZE + WINZIP_AES_AUTH_SIZE : 0)
+  const method = normalizedMode === ZIP_MODE_WINZIP_AES ? WINZIP_AES_METHOD : STORE_METHOD
+  const winZipAesExtra = normalizedMode === ZIP_MODE_WINZIP_AES ? buildWinZipAesExtra() : Buffer.alloc(0)
+  const meta = normalizedMode === ZIP_MODE_WINZIP_AES ? buildEncryptedMeta(password, originalName, zipInnerName, normalizedMode) : Buffer.alloc(0)
   const localExtra = buildCustomExtra({
     zipMode: normalizedMode,
     salt: salt || Buffer.alloc(SALT_SIZE),
     nonce: nonce || Buffer.alloc(NONCE_SIZE),
+    meta,
     checkpoints: normalizedMode === ZIP_MODE_COMPATIBLE ? Buffer.alloc(0) : undefined,
   })
   const centralExtra = buildCustomExtra({
     zipMode: normalizedMode,
     salt: salt || Buffer.alloc(SALT_SIZE),
     nonce: nonce || Buffer.alloc(NONCE_SIZE),
+    meta,
     checkpoints: normalizedMode === ZIP_MODE_COMPATIBLE ? emptyCheckpoints(plainSize) : undefined,
   })
-  const header = buildLocalHeader({ plainSize, compressedSize, innerName: zipInnerName, customExtra: localExtra })
+  const header = buildLocalHeader({
+    plainSize,
+    compressedSize,
+    innerName: zipInnerName,
+    customExtra: Buffer.concat([localExtra, winZipAesExtra]),
+    method,
+  })
   const tail = buildTail({
     crc: 0,
     plainSize,
     compressedSize,
     innerName: zipInnerName,
-    customExtra: centralExtra,
+    customExtra: Buffer.concat([centralExtra, winZipAesExtra]),
     headerSize: header.length,
+    method,
   })
   return {
     zipMode: normalizedMode,
     headerSize: header.length,
     compressedSize,
+    dataHeaderSize:
+      normalizedMode === ZIP_MODE_COMPATIBLE
+        ? ZIPCRYPTO_HEADER_SIZE
+        : normalizedMode === ZIP_MODE_WINZIP_AES
+          ? WINZIP_AES_SALT_SIZE + WINZIP_AES_VERIFY_SIZE
+          : 0,
+    authSize: normalizedMode === ZIP_MODE_WINZIP_AES ? WINZIP_AES_AUTH_SIZE : 0,
     packageSize: header.length + compressedSize + tail.length,
     innerName: zipInnerName,
   }
@@ -774,7 +972,7 @@ function findCompatibleCheckpoint(zipInfo, position) {
   return checkpoint
 }
 
-export async function parseZipInfoFromReader(readRange, totalSize) {
+export async function parseZipInfoFromReader(readRange, totalSize, options = {}) {
   const fixed = await readRange(0, 30)
   if (fixed.length < 30 || fixed.readUInt32LE(0) !== 0x04034b50) {
     throw new Error('not a zip package encrypted file')
@@ -794,33 +992,46 @@ export async function parseZipInfoFromReader(readRange, totalSize) {
   const { centralOffset } = await parseEocd(tail, tailStart, readRange)
   const central = await parseCentralDirectory(readRange, centralOffset)
   const custom = parseCustomExtra(central.extra.length ? central.extra : local.extra)
-  const zipMode = normalizeZipMode(custom.zipMode)
+  const customMeta = custom.meta && custom.meta.length ? decryptMeta(options.password, custom.meta) : null
+  const winZipAes = parseWinZipAesExtra(central.extra.length ? central.extra : local.extra)
+  const zipMode = winZipAes ? ZIP_MODE_WINZIP_AES : normalizeZipMode(custom.zipMode)
   const plainSize = central.uncompressedSize
   const compressedSize = central.compressedSize
-  const dataHeaderSize = zipMode === ZIP_MODE_COMPATIBLE ? ZIPCRYPTO_HEADER_SIZE : 0
+  const dataHeaderSize =
+    zipMode === ZIP_MODE_COMPATIBLE
+      ? ZIPCRYPTO_HEADER_SIZE
+      : zipMode === ZIP_MODE_WINZIP_AES
+        ? WINZIP_AES_SALT_SIZE + WINZIP_AES_VERIFY_SIZE
+        : 0
+  const authSize = zipMode === ZIP_MODE_WINZIP_AES ? WINZIP_AES_AUTH_SIZE : 0
 
   return {
     encType: ZIP_ENC_TYPE,
     zipMode,
     version: custom.version,
     mode: custom.mode,
-    origName: custom.origName || null,
-    innerName: central.name || local.name || INNER_FILENAME,
+    origName: customMeta?.origName || custom.origName || null,
+    innerName: customMeta?.innerName || central.name || local.name || INNER_FILENAME,
     salt: custom.salt,
     nonce: custom.nonce,
+    meta: custom.meta,
+    metaInfo: customMeta,
+    winZipAes,
     checkpoints: custom.checkpoints || [],
     cpInterval: custom.cpInterval || 0,
     headerSize: local.headerSize,
     encryptedHeaderOffset: local.headerSize,
     payloadOffset: local.headerSize + dataHeaderSize,
     payloadSize: plainSize,
+    authTagOffset: local.headerSize + compressedSize - authSize,
+    authSize,
     plainSize,
     compressedSize,
     totalSize,
   }
 }
 
-export async function parseZipInfoFromFile(filePath) {
+export async function parseZipInfoFromFile(filePath, options = {}) {
   const stat = await fs.promises.stat(filePath)
   const handle = await fs.promises.open(filePath, 'r')
   try {
@@ -829,16 +1040,16 @@ export async function parseZipInfoFromFile(filePath) {
       const result = await handle.read(buffer, 0, length, start)
       return buffer.subarray(0, result.bytesRead)
     }
-    return await parseZipInfoFromReader(readRange, stat.size)
+    return await parseZipInfoFromReader(readRange, stat.size, options)
   } finally {
     await handle.close()
   }
 }
 
-export async function parseZipInfoFromRemote(urlAddr, headers = {}, candidateSize = 0) {
+export async function parseZipInfoFromRemote(urlAddr, headers = {}, candidateSize = 0, options = {}) {
   const totalSize = await getRemoteSize(urlAddr, headers, Number(candidateSize) || 0)
   const readRange = (start, length) => readRemoteRange(urlAddr, headers, start, length)
-  return await parseZipInfoFromReader(readRange, totalSize)
+  return await parseZipInfoFromReader(readRange, totalSize, options)
 }
 
 export function isZipEncType(encType) {
@@ -916,10 +1127,17 @@ class ZipPackageEnc {
     this.originalName = normalizeName(this.options.originalName || this.options.origName || this.innerName)
     this.salt = this.zipInfo && this.zipInfo.salt ? Buffer.from(this.zipInfo.salt) : crypto.randomBytes(SALT_SIZE)
     this.nonce = this.zipInfo && this.zipInfo.nonce ? Buffer.from(this.zipInfo.nonce) : crypto.randomBytes(NONCE_SIZE)
+    this.winZipAesSalt =
+      this.zipInfo && this.zipInfo.salt && this.zipInfo.zipMode === ZIP_MODE_WINZIP_AES
+        ? Buffer.from(this.zipInfo.salt)
+        : crypto.randomBytes(WINZIP_AES_SALT_SIZE)
     this.key = deriveKey(password, this.salt)
+    this.winZipAesKeys = this.zipMode === ZIP_MODE_WINZIP_AES ? deriveWinZipAesKeys(password, this.winZipAesSalt) : null
     this.position = 0
     this.skipBytes = 0
     this.cipher = createCtrCipher(this.key, this.nonce, 0)
+    this.winZipAesCipher = this.winZipAesKeys ? createWinZipAesCtr(this.winZipAesKeys.encKey, 0) : null
+    this.winZipAesHmac = this.winZipAesKeys ? crypto.createHmac('sha1', this.winZipAesKeys.macKey) : null
     this.zipCrypto = null
   }
 
@@ -929,6 +1147,7 @@ class ZipPackageEnc {
       originalName: options.originalName || options.origName || INNER_FILENAME,
       innerName: options.innerName,
       zipMode: options.zipMode,
+      password: options.password || '',
     })
     return layout.packageSize
   }
@@ -939,6 +1158,7 @@ class ZipPackageEnc {
       originalName: options.originalName || options.origName || INNER_FILENAME,
       innerName: options.innerName,
       zipMode: options.zipMode,
+      password: options.password || '',
     })
   }
 
@@ -952,11 +1172,20 @@ class ZipPackageEnc {
       return
     }
     this.skipBytes = 0
+    if (this.zipInfo && this.zipInfo.zipMode === ZIP_MODE_WINZIP_AES) {
+      this.winZipAesSalt = Buffer.from(this.zipInfo.salt)
+      this.winZipAesKeys = deriveWinZipAesKeys(this.password, this.winZipAesSalt)
+      this.winZipAesCipher = createWinZipAesCtr(this.winZipAesKeys.encKey, this.position)
+      this.winZipAesHmac = crypto.createHmac('sha1', this.winZipAesKeys.macKey)
+      return
+    }
     this.cipher = createCtrCipher(this.key, this.nonce, this.position)
   }
 
   encryptTransform() {
-    return this.zipMode === ZIP_MODE_COMPATIBLE ? this.compatibleEncryptTransform() : this.fakeEncryptTransform()
+    if (this.zipMode === ZIP_MODE_COMPATIBLE) return this.compatibleEncryptTransform()
+    if (this.zipMode === ZIP_MODE_WINZIP_AES) return this.winZipAesEncryptTransform()
+    return this.fakeEncryptTransform()
   }
 
   compatibleEncryptTransform() {
@@ -1085,8 +1314,70 @@ class ZipPackageEnc {
     })
   }
 
+  winZipAesEncryptTransform() {
+    this.winZipAesSalt = crypto.randomBytes(WINZIP_AES_SALT_SIZE)
+    this.winZipAesKeys = deriveWinZipAesKeys(this.password, this.winZipAesSalt)
+    const aesExtra = buildWinZipAesExtra()
+    const meta = buildEncryptedMeta(this.password, this.originalName, this.innerName, ZIP_MODE_WINZIP_AES)
+    const customExtra = buildCustomExtra({ zipMode: ZIP_MODE_WINZIP_AES, salt: this.winZipAesSalt, meta })
+    const compressedSize = this.plainSize + WINZIP_AES_SALT_SIZE + WINZIP_AES_VERIFY_SIZE + WINZIP_AES_AUTH_SIZE
+    const header = buildLocalHeader({
+      plainSize: this.plainSize,
+      compressedSize,
+      innerName: this.innerName,
+      customExtra: Buffer.concat([customExtra, aesExtra]),
+      method: WINZIP_AES_METHOD,
+    })
+    let started = false
+    let written = 0
+    const cipher = createWinZipAesCtr(this.winZipAesKeys.encKey, 0)
+    const hmac = crypto.createHmac('sha1', this.winZipAesKeys.macKey)
+    const self = this
+
+    return new Transform({
+      transform(chunk, encoding, next) {
+        if (!started) {
+          this.push(header)
+          this.push(self.winZipAesSalt)
+          this.push(self.winZipAesKeys.verifier)
+          started = true
+        }
+        const encrypted = cipher.update(chunk)
+        hmac.update(encrypted)
+        written += chunk.length
+        next(null, encrypted)
+      },
+      flush(next) {
+        if (!started) {
+          this.push(header)
+          this.push(self.winZipAesSalt)
+          this.push(self.winZipAesKeys.verifier)
+        }
+        const final = cipher.final()
+        if (final.length) {
+          hmac.update(final)
+          this.push(final)
+        }
+        this.push(hmac.digest().subarray(0, WINZIP_AES_AUTH_SIZE))
+        const tail = buildTail({
+          crc: 0,
+          plainSize: written || self.plainSize,
+          compressedSize: (written || self.plainSize) + WINZIP_AES_SALT_SIZE + WINZIP_AES_VERIFY_SIZE + WINZIP_AES_AUTH_SIZE,
+          innerName: self.innerName,
+          customExtra: Buffer.concat([customExtra, aesExtra]),
+          headerSize: header.length,
+          method: WINZIP_AES_METHOD,
+        })
+        this.push(tail)
+        next()
+      },
+    })
+  }
+
   decryptTransform() {
-    return this.zipMode === ZIP_MODE_COMPATIBLE ? this.compatibleDecryptTransform() : this.fakeDecryptTransform()
+    if (this.zipMode === ZIP_MODE_COMPATIBLE) return this.compatibleDecryptTransform()
+    if (this.zipMode === ZIP_MODE_WINZIP_AES) return this.winZipAesDecryptTransform()
+    return this.fakeDecryptTransform()
   }
 
   compatibleDecryptTransform() {
@@ -1111,6 +1402,22 @@ class ZipPackageEnc {
       },
       flush(next) {
         const final = self.cipher.final()
+        if (final.length) {
+          this.push(final)
+        }
+        next()
+      },
+    })
+  }
+
+  winZipAesDecryptTransform() {
+    const self = this
+    return new Transform({
+      transform(chunk, encoding, next) {
+        next(null, self.winZipAesCipher.update(chunk))
+      },
+      flush(next) {
+        const final = self.winZipAesCipher.final()
         if (final.length) {
           this.push(final)
         }

@@ -78,7 +78,7 @@ export async function encryptFile(
     }
     let zipInfo: any = null
     if (enc === 'dec' && isZipEncType(encType)) {
-      zipInfo = await parseZipInfoFromFile(filePath)
+      zipInfo = await parseZipInfoFromFile(filePath, { password })
       if (!encName && zipInfo.origName) {
         relativePath = path.join(childPath, zipInfo.origName)
       }

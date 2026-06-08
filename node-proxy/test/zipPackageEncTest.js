@@ -8,9 +8,11 @@ import { Readable, Writable } from 'stream'
 import { finished } from 'stream/promises'
 
 import FlowEnc from '@/utils/flowEnc'
+import ZipPackageEnc from '@/utils/zipPackageEnc'
 import {
   ZIP_MODE_COMPATIBLE,
   ZIP_MODE_FAKE,
+  ZIP_MODE_WINZIP_AES,
   parseZipInfoFromFile,
   prepareZipDownloadRequest,
 } from '@/utils/zipPackageEnc'
@@ -58,19 +60,25 @@ async function decryptRange(filePath, rangeHeader) {
 
 async function verifyMode(zipMode) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'alist-zip-test-'))
+  const originalName = '测试 视频.final.mp4'
   const plain = Buffer.concat([
     Buffer.from('ftyp'),
     crypto.randomBytes(256 * 1024 + 333),
     Buffer.from('tail-marker'),
   ])
   const zipPath = path.join(tempDir, `${zipMode}.zip`)
-  await encryptToFile(plain, zipPath, zipMode, '测试 视频.final.mp4')
+  await encryptToFile(plain, zipPath, zipMode, originalName)
   fs.writeFileSync(path.join(tempDir, 'plain.bin'), plain)
   const zipInfo = await parseZipInfoFromFile(zipPath)
 
   assert.strictEqual(zipInfo.plainSize, plain.length)
   assert.strictEqual(zipInfo.zipMode, zipMode)
   assert.ok(zipInfo.payloadOffset > 30, 'payload must start after ZIP headers')
+  assert.strictEqual(
+    fs.statSync(zipPath).size,
+    ZipPackageEnc.packageSize(plain.length, { originalName, zipMode, password }),
+    `${zipMode} package size`
+  )
 
   const ranges = [
     [0, 63],
@@ -99,6 +107,30 @@ async function verifyMode(zipMode) {
     ].join('\n')
     childProcess.execFileSync('python', ['-c', verifyScript, zipPath, path.join(tempDir, 'plain.bin')], { stdio: 'pipe' })
   }
+
+  if (zipMode === ZIP_MODE_WINZIP_AES) {
+    const zipBytes = fs.readFileSync(zipPath)
+    const namedInfo = await parseZipInfoFromFile(zipPath, { password })
+    assert.strictEqual(namedInfo.origName, originalName)
+    assert.ok(!zipBytes.includes(Buffer.from(originalName, 'utf8')), 'original name must stay encrypted')
+    assert.strictEqual(zipInfo.compressedSize, plain.length + 28)
+    assert.strictEqual(zipInfo.authSize, 10)
+    const header = zipBytes.subarray(0, zipInfo.headerSize)
+    assert.strictEqual(header.readUInt16LE(8), 99)
+    assert.ok(header.includes(Buffer.from([0x01, 0x99, 0x07, 0x00, 0x02, 0x00, 0x41, 0x45, 0x03, 0x00, 0x00])))
+    const verifyScript = [
+      'import pathlib, sys, pyzipper',
+      'zip_path = pathlib.Path(sys.argv[1])',
+      'plain_path = pathlib.Path(sys.argv[2])',
+      'with pyzipper.AESZipFile(zip_path) as zf:',
+      "    zf.setpassword(b'admin123')",
+      '    names = zf.namelist()',
+      "    assert names == ['payload.mp4'], names",
+      '    data = zf.read(names[0])',
+      'assert data == plain_path.read_bytes()',
+    ].join('\n')
+    childProcess.execFileSync('python', ['-c', verifyScript, zipPath, path.join(tempDir, 'plain.bin')], { stdio: 'pipe' })
+  }
 }
 
 async function verifyNames() {
@@ -119,6 +151,7 @@ async function verifyNames() {
 async function main() {
   await verifyNames()
   await verifyMode(ZIP_MODE_COMPATIBLE)
+  await verifyMode(ZIP_MODE_WINZIP_AES)
   await verifyMode(ZIP_MODE_FAKE)
   console.log('zipPackageEncTest ok')
 }

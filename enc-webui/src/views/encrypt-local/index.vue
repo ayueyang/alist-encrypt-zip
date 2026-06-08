@@ -20,7 +20,8 @@
           <!-- <el-radio label="mix" border>MIX</el-radio> -->
           <el-radio label="aesctr" border>AES-CTR</el-radio>
           <el-radio label="rc4" border>RC4</el-radio>
-          <el-radio label="zip-compatible" border>真ZIP</el-radio>
+          <el-radio label="zip-compatible" border>真ZIP(ZipCrypto)</el-radio>
+          <el-radio label="zip-winzip-aes" border>WinZip AES</el-radio>
           <el-radio label="zip-fake" border>伪装ZIP</el-radio>
         </el-radio-group>
       </el-form-item>
@@ -90,7 +91,9 @@ const alistConfigForm = reactive({})
 const refSearchForm = $ref()
 const getEncChoice = (item) => {
   if (item.encType === 'zip') {
-    return item.zipMode === 'fake' ? 'zip-fake' : 'zip-compatible'
+    if (item.zipMode === 'fake') return 'zip-fake'
+    if (item.zipMode === 'winzip-aes') return 'zip-winzip-aes'
+    return 'zip-compatible'
   }
   return item.encType
 }
@@ -104,6 +107,11 @@ const setEncChoice = (item, value) => {
   if (value === 'zip-fake') {
     item.encType = 'zip'
     item.zipMode = 'fake'
+    return
+  }
+  if (value === 'zip-winzip-aes') {
+    item.encType = 'zip'
+    item.zipMode = 'winzip-aes'
     return
   }
   item.encType = value

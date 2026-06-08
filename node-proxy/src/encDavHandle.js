@@ -181,7 +181,7 @@ const handle = async (ctx, next) => {
     const fileDetail = { path: url, name: fileName, is_dir: false, size: contentLength }
     if (realName !== fileName) {
       const realSize = isZipEncType(passwdInfo.encType)
-        ? ZipPackageEnc.packageSize(Number(contentLength) || 0, { originalName: fileName, zipMode: passwdInfo.zipMode })
+        ? ZipPackageEnc.packageSize(Number(contentLength) || 0, { originalName: fileName, zipMode: passwdInfo.zipMode, password: passwdInfo.password })
         : contentLength
       const realFileDetail = { path: request.url, name: realName, is_dir: false, size: realSize }
       await cacheFileInfo(realFileDetail)
