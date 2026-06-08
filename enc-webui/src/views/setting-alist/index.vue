@@ -26,6 +26,7 @@
             <!-- <el-radio label="mix" border>MIX</el-radio> -->
             <el-radio label="aesctr" border>AES-CTR</el-radio>
             <el-radio label="rc4" border>RC4</el-radio>
+            <el-radio label="zip" border>ZIP包</el-radio>
           </el-radio-group>
           开启
           <el-switch v-model="item.enable" class="ml-2" style="--el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949" />
@@ -37,6 +38,10 @@
         <el-form-item label="文件名">
           加密
           <el-switch v-model="item.encName" class="ml-2" style="margin-right: 10px; --el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949" />
+          <el-radio-group v-if="item.encType === 'zip'" v-model="item.zipMode" size="small" style="margin-left: 10px">
+            <el-radio label="compatible" border>Compatible</el-radio>
+            <el-radio label="fake" border>Fake</el-radio>
+          </el-radio-group>
           <!-- 后缀
           <el-input v-model="item.encSuffix" style="max-width: 150px; margin-left: 10px" placeholder="默认原文件名后缀" /> -->
         </el-form-item>
@@ -68,6 +73,7 @@
                   <!-- <el-radio label="mix" border>MIX</el-radio> -->
                   <el-radio label="aesctr" border>AES-CTR</el-radio>
                   <el-radio label="rc4" border>RC4</el-radio>
+                  <el-radio label="zip" border>ZIP包</el-radio>
                 </el-radio-group>
               </el-form-item>
               <el-form-item prop="username" label="文件夹密码">
@@ -142,6 +148,7 @@ const alistConfigForm = reactive({
       id: Math.random(),
       password: '123456',
       encType: 'aesctr',
+      zipMode: 'compatible',
       enable: false,
       encName: false, // encrypt file name
       encSuffix: '', //
@@ -157,6 +164,7 @@ const addPasswd = () => {
     id: Math.random(),
     password: '123456',
     encType: 'aesctr',
+    zipMode: 'compatible',
     enable: true,
     describe: 'my video',
     encPath: '/aliyun/encrypt/*'
@@ -192,6 +200,7 @@ onMounted(async () => {
   const res = await getAlistConfigReq()
   for (const passwdInfo of res.data.passwdList) {
     passwdInfo.id = Math.random()
+    passwdInfo.zipMode = passwdInfo.zipMode || 'compatible'
     passwdInfo.encPath = passwdInfo.encPath.reduce((a, b) => `${a},${b}`)
   }
   Object.assign(alistConfigForm, res.data)

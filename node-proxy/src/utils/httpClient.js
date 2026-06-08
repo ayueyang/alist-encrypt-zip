@@ -3,7 +3,8 @@ import https from 'node:https'
 import crypto, { randomUUID } from 'crypto'
 import levelDB from './levelDB'
 import path from 'path'
-import { decodeName } from './commonUtil'
+import { convertShowName } from './commonUtil'
+import { applyZipResponseHeaders } from './zipPackageEnc'
 // import { pathExec } from './commonUtil'
 const Agent = http.Agent
 const Agents = https.Agent
@@ -38,6 +39,9 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
           console.log()
           await levelDB.setExpire(key, { redirectUrl, passwdInfo, fileSize }, 60 * 60 * 72) // 缓存起来，默认3天，足够下载和观看了
           // 、Referer
+          if (request.zipVirtualName) {
+            await levelDB.setExpire(key, { redirectUrl, passwdInfo, fileSize, virtualName: request.zipVirtualName }, 60 * 60 * 72)
+          }
           httpResp.headers.location = `/redirect/${key}?decode=1&lastUrl=${encodeURIComponent(url)}`
         }
         console.log('302 redirectUrl:', redirectUrl)
@@ -49,9 +53,9 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
         response.setHeader(key, httpResp.headers[key])
       }
       // 下载时解密文件名
+      applyZipResponseHeaders(response, request)
       if (method === 'GET' && response.statusCode === 200 && passwdInfo && passwdInfo.enable && passwdInfo.encName) {
-        let fileName = decodeURIComponent(path.basename(url))
-        fileName = decodeName(passwdInfo.password, passwdInfo.encType, fileName.replace(path.extname(fileName), ''))
+        let fileName = convertShowName(passwdInfo.password, passwdInfo.encType, decodeURIComponent(path.basename(url)))
         if (fileName) {
           let cd = response.getHeader('content-disposition')
           cd = cd ? cd.replace(/filename\*?=[^=;]*;?/g, '') : ''
@@ -72,9 +76,31 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
       // 是否需要解密
       decryptTransform ? httpResp.pipe(decryptTransform).pipe(response) : httpResp.pipe(response)
     })
+    httpReq.setTimeout(0)
     httpReq.on('error', (err) => {
       console.log('@@httpProxy request error ', reqId, err, urlAddr, headers)
+      if (!response.headersSent) {
+        response.statusCode = 502
+      }
+      response.destroy(err)
+      reject(err)
     })
+    request.on('error', (err) => {
+      console.log('@@httpProxy local request error ', reqId, err && err.message)
+      httpReq.destroy(err)
+    })
+    if (encryptTransform) {
+      encryptTransform.on('error', (err) => {
+        console.log('@@httpProxy encrypt error ', reqId, err && err.stack ? err.stack : err)
+        httpReq.destroy(err)
+      })
+    }
+    if (decryptTransform) {
+      decryptTransform.on('error', (err) => {
+        console.log('@@httpProxy decrypt error ', reqId, err && err.stack ? err.stack : err)
+        response.destroy(err)
+      })
+    }
     // 是否需要加密
     encryptTransform ? request.pipe(encryptTransform).pipe(httpReq) : request.pipe(httpReq)
     // 重定向的请求 关闭时 关闭被重定向的请求

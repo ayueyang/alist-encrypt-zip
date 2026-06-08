@@ -20,6 +20,7 @@
           <!-- <el-radio label="mix" border>MIX</el-radio> -->
           <el-radio label="aesctr" border>AES-CTR</el-radio>
           <el-radio label="rc4" border>RC4</el-radio>
+          <el-radio label="zip" border>ZIP包</el-radio>
         </el-radio-group>
       </el-form-item>
       <el-form-item label="密码">

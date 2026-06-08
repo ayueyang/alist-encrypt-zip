@@ -3,11 +3,12 @@
 import MixEnc from './mixEnc'
 import Rc4Md5 from './rc4Md5'
 import AesCTR from './aesCTR'
+import ZipPackageEnc from './zipPackageEnc'
 
 const cachePasswdOutward = {}
 
 class FlowEnc {
-  constructor(password, encryptType = 'mix', fileSize = 0) {
+  constructor(password, encryptType = 'mix', fileSize = 0, options = {}) {
     fileSize *= 1
     let encryptFlow = null
     if (encryptType === 'mix') {
@@ -25,8 +26,16 @@ class FlowEnc {
       encryptFlow = new AesCTR(password, fileSize)
       this.passwdOutward = encryptFlow.passwdOutward
     }
+    if (encryptType === 'zip') {
+      console.log('@@ZipPackage', encryptType, fileSize)
+      encryptFlow = new ZipPackageEnc(password, fileSize, options)
+      this.passwdOutward = encryptFlow.passwdOutward
+    }
     if (encryptType === null) {
       throw new Error('FlowEnc error')
+    }
+    if (encryptFlow === null) {
+      throw new Error('FlowEnc unsupported encryptType: ' + encryptType)
     }
     cachePasswdOutward[password + encryptType] = this.passwdOutward
     this.encryptFlow = encryptFlow

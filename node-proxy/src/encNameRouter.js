@@ -2,10 +2,11 @@
 
 import Router from 'koa-router'
 import bodyparser from 'koa-bodyparser'
-import { encodeName, pathFindPasswd, convertShowName, convertRealName } from './utils/commonUtil'
+import { encodeName, pathFindPasswd, convertShowName, convertRealName, inferAListType } from './utils/commonUtil'
 import path from 'path'
 import { httpClient, httpProxy } from './utils/httpClient'
 import FlowEnc from './utils/flowEnc'
+import ZipPackageEnc, { isZipEncType } from './utils/zipPackageEnc'
 import { logger } from './common/logger'
 import { getFileInfo } from './dao/fileDao'
 
@@ -36,6 +37,7 @@ encNameRouter.all('/api/fs/list', async (ctx, next) => {
       const { passwdInfo } = pathFindPasswd(passwdList, decodeURI(fileInfo.path))
       if (passwdInfo && passwdInfo.encName) {
         fileInfo.name = convertShowName(passwdInfo.password, passwdInfo.encType, fileInfo.name)
+        fileInfo.type = inferAListType(fileInfo.name, fileInfo.type)
       }
     }
 
@@ -74,17 +76,40 @@ encNameRouter.put('/api/fs/put', async (ctx, next) => {
 
   const uploadPath = headers['file-path'] ? decodeURIComponent(headers['file-path']) : '/-'
   const { passwdInfo } = pathFindPasswd(webdavConfig.passwdList, uploadPath)
+  logger.info('@@upload put', {
+    uploadPath,
+    contentLength: request.fileSize,
+    encType: passwdInfo && passwdInfo.encType,
+    zipMode: passwdInfo && passwdInfo.zipMode,
+    encName: passwdInfo && passwdInfo.encName,
+  })
   if (passwdInfo) {
     const fileName = path.basename(uploadPath)
+    let realUploadPath = uploadPath
     // you can custom Suffix
     if (passwdInfo.encName) {
-      const ext = passwdInfo.encSuffix || path.extname(fileName)
-      const encName = encodeName(passwdInfo.password, passwdInfo.encType, fileName)
-      const filePath = path.dirname(uploadPath) + '/' + encName + ext
+      const filePath = path.dirname(uploadPath) + '/' + convertRealName(passwdInfo.password, passwdInfo.encType, fileName)
       console.log('@@@encfileName', fileName, uploadPath, filePath)
+      realUploadPath = filePath
       headers['file-path'] = encodeURIComponent(filePath)
     }
-    const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize)
+    const originalName = path.basename(uploadPath)
+    if (isZipEncType(passwdInfo.encType)) {
+      const packageSize = ZipPackageEnc.packageSize(request.fileSize, { originalName, zipMode: passwdInfo.zipMode })
+      headers['content-length'] = String(packageSize)
+      delete headers['x-expected-entity-length']
+      logger.info('@@zip upload package', {
+        originalName,
+        realUploadPath,
+        plainSize: request.fileSize,
+        packageSize,
+        zipMode: passwdInfo.zipMode,
+      })
+    }
+    const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize, {
+      originalName,
+      zipMode: passwdInfo.zipMode,
+    })
     return await httpProxy(ctx.req, ctx.res, flowEnc.encryptTransform())
   }
   return await httpProxy(ctx.req, ctx.res)
@@ -127,12 +152,7 @@ const copyOrMoveFile = async (ctx, next) => {
         fileNames.push(origName)
         break
       }
-      const fileName = path.basename(name)
-      // you can custom Suffix
-      const ext = passwdInfo.encSuffix || path.extname(fileName)
-      const encName = encodeName(passwdInfo.password, passwdInfo.encType, fileName)
-      const newFileName = encName + ext
-      fileNames.push(newFileName)
+      fileNames.push(convertRealName(passwdInfo.password, passwdInfo.encType, name))
     }
   } else {
     fileNames = Object.assign([], names)
@@ -156,6 +176,7 @@ encNameRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
   if (passwdInfo && passwdInfo.encName) {
     // reset content-length length
     delete ctx.req.headers['content-length']
+    ctx.req.zipVirtualPath = filePath
     // check fileName is not enc
     const fileName = path.basename(filePath)
     const fileInfo = await getFileInfo(encodeURIComponent(filePath))
@@ -168,12 +189,14 @@ encNameRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     const fpath = path.dirname(filePath) + '/' + realName
     console.log('@@@getFilePath', fpath)
     ctx.request.body.path = fpath
+    ctx.req.reqBody = JSON.stringify(ctx.request.body)
   }
   await next()
   if (passwdInfo && passwdInfo.encName) {
     // return showName
     const showName = convertShowName(passwdInfo.password, passwdInfo.encType, ctx.body.data.name)
     ctx.body.data.name = showName
+    ctx.body.data.type = inferAListType(showName, ctx.body.data.type)
   }
 })
 
@@ -196,12 +219,10 @@ encNameRouter.all('/api/fs/rename', bodyparserMw, async (ctx, next) => {
   if (passwdInfo && passwdInfo.encName && fileInfo && !fileInfo.is_dir) {
     // reset content-length length
     // you can custom Suffix
-    const ext = passwdInfo.encSuffix || path.extname(name)
     const realName = convertRealName(passwdInfo.password, passwdInfo.encType, filePath)
     const fpath = path.dirname(filePath) + '/' + realName
-    const newName = encodeName(passwdInfo.password, passwdInfo.encType, name)
     reqBody.path = fpath
-    reqBody.name = newName + ext
+    reqBody.name = convertRealName(passwdInfo.password, passwdInfo.encType, name)
   }
   ctx.req.reqBody = reqBody
   console.log('@@@rename', reqBody)
@@ -228,6 +249,7 @@ const handleDownload = async (ctx, next) => {
   if (passwdInfo && passwdInfo.encName) {
     // reset content-length length
     delete ctx.req.headers['content-length']
+    request.zipVirtualName = path.basename(filePath)
     // Check whether the file name refers to an encrypted file or a directory
     const fileName = path.basename(filePath)
     const realName = convertRealName(passwdInfo.password, passwdInfo.encType, fileName)

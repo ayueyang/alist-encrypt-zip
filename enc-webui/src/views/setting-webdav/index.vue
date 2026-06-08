@@ -32,6 +32,7 @@
             <el-radio-group v-model="item.encType" style="margin: 0 25px" size="small">
               <!-- <el-radio label="mix" border>MIX</el-radio> -->
               <el-radio label="rc4" border>RC4</el-radio>
+              <el-radio label="zip" border>ZIP包</el-radio>
               <el-radio label="aesctr" border>AES-CTR(新)</el-radio>
             </el-radio-group>
             开启
@@ -47,6 +48,10 @@
                 class="ml-2"
                 style="margin-right: 10px; --el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949"
               />
+              <el-radio-group v-if="item.encType === 'zip'" v-model="item.zipMode" size="small" style="margin-left: 10px">
+                <el-radio label="compatible" border>Compatible</el-radio>
+                <el-radio label="fake" border>Fake</el-radio>
+              </el-radio-group>
               <!-- 后缀
               <el-input v-model="item.encSuffix" style="max-width: 150px; margin-left: 10px" placeholder="默认原文件名后缀" /> -->
             </el-form-item>
@@ -117,6 +122,7 @@ const configTemp = {
       id: Math.random(),
       password: '123456',
       encType: 'aesctr',
+      zipMode: 'compatible',
       enable: false,
       encName: false, // encrypt file name
       encSuffix: '', //
@@ -134,6 +140,7 @@ const addPasswd = () => {
     id: Math.random(),
     password: '123456',
     encType: 'aesctr',
+    zipMode: 'compatible',
     enable: true,
     describe: 'my video',
     encPath: '/dav/encrypt/*'
@@ -189,6 +196,7 @@ const refreshConfigList = async (result) => {
     const passwdList = element.passwdList
     for (const passwdInfo of passwdList) {
       passwdInfo.id = Math.random()
+      passwdInfo.zipMode = passwdInfo.zipMode || 'compatible'
       // passwdInfo.encPath = passwdInfo.encPath.reduce((a, b) => `${a},${b}`)
     }
     configList.push(element)

@@ -182,7 +182,7 @@ router.all('/decodeFoldName', async (ctx, next) => {
 
 // encrypt or decrypt file
 router.all('/encryptFile', async (ctx, next) => {
-  const { folderPath, outPath, encType, password, operation, encName } = ctx.request.body
+  const { folderPath, outPath, encType, password, operation, encName, zipMode } = ctx.request.body
   if (!fs.existsSync(folderPath)) {
     ctx.body = { msg: 'encrypt file path not exists', code: 500 }
     return
@@ -192,7 +192,7 @@ router.all('/encryptFile', async (ctx, next) => {
     ctx.body = { msg: 'too maney file, exceeding 10000', code: 500 }
     return
   }
-  encryptFile(password, encType, operation, folderPath, outPath, encName)
+  encryptFile(password, encType, operation, folderPath, outPath, encName, zipMode)
   ctx.body = { msg: 'waiting operation' }
 })
 

@@ -15,9 +15,17 @@ import path from 'path'
 import { httpProxy, httpClient } from '@/utils/httpClient'
 import bodyparser from 'koa-bodyparser'
 import FlowEnc from '@/utils/flowEnc'
+import ZipPackageEnc, { isZipEncType, parseZipInfoFromRemote, prepareZipDownloadRequest } from '@/utils/zipPackageEnc'
+import {
+  canServeZipCacheRange,
+  getZipCacheEntry,
+  serveZipCacheRange,
+  startZipCacheDownload,
+  zipCacheKey,
+} from '@/utils/zipDiskCache'
 import levelDB from '@/utils/levelDB'
 import { webdavServer, alistServer, port, version } from '@/config'
-import { pathExec, pathFindPasswd } from '@/utils/commonUtil'
+import { convertRealName, pathExec, pathFindPasswd } from '@/utils/commonUtil'
 import globalHandle from '@/middleware/globalHandle'
 import encApiRouter from '@/router'
 import encNameRouter from '@/encNameRouter'
@@ -27,7 +35,6 @@ import { cacheFileInfo, getFileInfo } from '@/dao/fileDao'
 import { getWebdavFileInfo } from '@/utils/webdavClient'
 import staticServer from 'koa-static'
 import { logger } from '@/common/logger'
-import { encodeName } from '@/utils/commonUtil'
 
 async function sleep(time) {
   return new Promise((resolve) => {
@@ -35,6 +42,58 @@ async function sleep(time) {
       resolve()
     }, time || 3000)
   })
+}
+
+function setUploadPackageSize(request, passwdInfo, plainSize, originalName) {
+  if (!isZipEncType(passwdInfo.encType)) {
+    return
+  }
+  const packageSize = ZipPackageEnc.packageSize(plainSize, { originalName, zipMode: passwdInfo.zipMode })
+  request.zipPlainSize = plainSize
+  request.zipPackageSize = packageSize
+  request.headers['content-length'] = String(packageSize)
+  delete request.headers['x-expected-entity-length']
+}
+
+function serializeZipInfo(zipInfo) {
+  if (!zipInfo) return null
+  return {
+    ...zipInfo,
+    salt: zipInfo.salt ? Buffer.from(zipInfo.salt).toString('hex') : undefined,
+    nonce: zipInfo.nonce ? Buffer.from(zipInfo.nonce).toString('hex') : undefined,
+  }
+}
+
+function deserializeZipInfo(zipInfo) {
+  if (!zipInfo) return null
+  return {
+    ...zipInfo,
+    salt: zipInfo.salt ? Buffer.from(zipInfo.salt, 'hex') : undefined,
+    nonce: zipInfo.nonce ? Buffer.from(zipInfo.nonce, 'hex') : undefined,
+  }
+}
+
+function getZipCacheHeaders(headers, urlAddr) {
+  const next = { ...headers }
+  delete next.host
+  delete next.referer
+  delete next.authorization
+  delete next.range
+  delete next['content-length']
+  delete next['accept-encoding']
+  if (urlAddr && urlAddr.indexOf('baidupcs.com') >= 0) {
+    next['User-Agent'] = 'pan.baidu.com'
+  }
+  return next
+}
+
+async function prepareZipDecrypt(request, passwdInfo, sourceSize, rangeHeader, cachedZipInfo = null) {
+  const zipInfo = cachedZipInfo || (await parseZipInfoFromRemote(request.urlAddr, request.headers, sourceSize))
+  request.zipVirtualName = request.zipVirtualName || path.basename(decodeURIComponent(request.url.split('?')[0] || zipInfo.innerName))
+  prepareZipDownloadRequest(request, zipInfo, rangeHeader)
+  const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, zipInfo.plainSize, { zipInfo })
+  await flowEnc.setPosition(request.zipPlainRange.start)
+  return flowEnc
 }
 
 const proxyRouter = new Router()
@@ -64,14 +123,10 @@ proxyRouter.all('/redirect/:key', async (ctx) => {
     ctx.body = 'no found'
     return
   }
-  const { passwdInfo, redirectUrl, fileSize } = data
+  const { passwdInfo, redirectUrl, fileSize, virtualName, zipInfo: cachedZipInfoData, zipCacheId } = data
   // 要定位请求文件的位置 bytes=98304-
   const range = request.headers.range
   const start = range ? range.replace('bytes=', '').split('-')[0] * 1 : 0
-  const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, fileSize)
-  if (start) {
-    await flowEnc.setPosition(start)
-  }
   // 设置请求地址和是否要解密
   const decode = ctx.query.decode
   // 修改百度头
@@ -84,17 +139,41 @@ proxyRouter.all('/redirect/:key', async (ctx) => {
   // aliyun不允许这个referer，不然会出现403
   delete request.headers.referer
   request.passwdInfo = passwdInfo
+  request.zipVirtualName = virtualName
   // 123网盘和天翼网盘多次302
   request.fileSize = fileSize
   // authorization 是alist网页版的token，不是webdav的，这里修复天翼云无法获取资源的问题
   delete request.headers.authorization
 
   // 默认判断路径来识别是否要解密，如果有decode参数，那么则按decode来处理，这样可以让用户手动处理是否解密？(那还不如直接在alist下载)
-  let decryptTransform = passwdInfo.enable && pathExec(passwdInfo.encPath, request.url) ? flowEnc.decryptTransform() : null
+  let shouldDecode = passwdInfo.enable && pathExec(passwdInfo.encPath, request.url)
   if (decode) {
-    decryptTransform = decode !== '0' ? flowEnc.decryptTransform() : null
+    shouldDecode = decode !== '0'
+  }
+  let decryptTransform = null
+  if (shouldDecode) {
+    let flowEnc = null
+    if (isZipEncType(passwdInfo.encType)) {
+      flowEnc = await prepareZipDecrypt(request, passwdInfo, fileSize, range, deserializeZipInfo(cachedZipInfoData))
+    } else {
+      flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, fileSize)
+      if (start) {
+        await flowEnc.setPosition(start)
+      }
+    }
+    decryptTransform = flowEnc.decryptTransform()
   }
   // 请求实际服务资源
+  if (shouldDecode && isZipEncType(passwdInfo.encType) && zipCacheId && request.zipPackageRange) {
+    const cacheEntry = getZipCacheEntry(zipCacheId, fileSize)
+    startZipCacheDownload(cacheEntry, redirectUrl, getZipCacheHeaders(request.headers, redirectUrl))
+    if (canServeZipCacheRange(cacheEntry, request.zipPackageRange)) {
+      await serveZipCacheRange(response, request, cacheEntry, decryptTransform)
+      logger.info('----finish redirect cache---', decode, request.urlAddr)
+      return
+    }
+    response.setHeader('x-zip-cache', 'miss')
+  }
   await httpProxy(request, response, null, decryptTransform)
   logger.info('----finish redirect---', decode, request.urlAddr, decryptTransform === null)
 })
@@ -149,7 +228,13 @@ async function proxyHandle(ctx, next) {
     if (request.fileSize === 0) {
       return await httpProxy(request, response)
     }
-    const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize)
+    request.passwdInfo = passwdInfo
+    const originalName = request.zipVirtualName || path.basename(decodeURIComponent(request.url.split('?')[0]))
+    setUploadPackageSize(request, passwdInfo, request.fileSize, originalName)
+    const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize, {
+      originalName,
+      zipMode: passwdInfo.zipMode,
+    })
     return await httpProxy(request, response, flowEnc.encryptTransform())
   }
   // 如果是下载文件，那么就进行判断是否解密
@@ -171,13 +256,12 @@ async function proxyHandle(ctx, next) {
 
     if (fileInfo === null) {
       const rawFileName = decodeURIComponent(path.basename(filePath));
-      const ext = path.extname(rawFileName);
       const encodedRawFileName = encodeURIComponent(rawFileName);
-      const encFileName = encodeName(passwdInfo.password, passwdInfo.encType, rawFileName);
-      const newFileName = encFileName + ext;
+      const newFileName = convertRealName(passwdInfo.password, passwdInfo.encType, rawFileName);
     
       filePath = filePath.replace(encodedRawFileName, newFileName);
       request.urlAddr = request.urlAddr.replace(encodedRawFileName, newFileName);
+      request.zipVirtualName = rawFileName
     
       fileInfo = await getFileInfo(filePath);
     }
@@ -204,9 +288,14 @@ async function proxyHandle(ctx, next) {
       // 说明不用加密
       return await httpProxy(request, response)
     }
-    const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize)
-    if (start) {
-      await flowEnc.setPosition(start)
+    let flowEnc = null
+    if (isZipEncType(passwdInfo.encType)) {
+      flowEnc = await prepareZipDecrypt(request, passwdInfo, request.fileSize, range)
+    } else {
+      flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize)
+      if (start) {
+        await flowEnc.setPosition(start)
+      }
     }
     return await httpProxy(request, response, null, flowEnc.decryptTransform())
   }
@@ -238,6 +327,7 @@ proxyRouter.get(/^\/p\/*/, proxyHandle)
 // 处理在线视频播放的问题，修改它的返回播放地址 为本代理的地址。
 proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
   const { path } = ctx.request.body
+  const virtualPath = ctx.req.zipVirtualPath || path
   // 判断打开的文件是否要解密，要解密则替换url，否则透传
   ctx.req.reqBody = JSON.stringify(ctx.request.body)
 
@@ -249,11 +339,36 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
   if (passwdInfo) {
     // 修改返回的响应，匹配到要解密，就302跳转到本服务上进行代理流量
     logger.info('@@getFile ', path, ctx.req.reqBody, result)
+    const remoteFileSize = result.data.size
+    let zipInfo = null
+    let zipCacheId = null
+    if (isZipEncType(passwdInfo.encType)) {
+      zipInfo = await parseZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize)
+      result.data.size = zipInfo.plainSize
+      zipCacheId = zipCacheKey({ virtualPath, redirectUrl: result.data.raw_url, fileSize: remoteFileSize, passwdInfo })
+      startZipCacheDownload(
+        getZipCacheEntry(zipCacheId, remoteFileSize),
+        result.data.raw_url,
+        getZipCacheHeaders(ctx.req.headers, result.data.raw_url)
+      )
+    }
     const key = crypto.randomUUID()
-    await levelDB.setExpire(key, { redirectUrl: result.data.raw_url, passwdInfo, fileSize: result.data.size }, 60 * 60 * 72) // 缓存起来，默认3天，足够下载和观看了
+    await levelDB.setExpire(key, { redirectUrl: result.data.raw_url, passwdInfo, fileSize: remoteFileSize }, 60 * 60 * 72) // 缓存起来，默认3天，足够下载和观看了
+    await levelDB.setExpire(
+      key,
+      {
+        redirectUrl: result.data.raw_url,
+        passwdInfo,
+        fileSize: remoteFileSize,
+        virtualName: decodeURIComponent(virtualPath.split('/').pop() || ''),
+        zipInfo: serializeZipInfo(zipInfo),
+        zipCacheId,
+      },
+      60 * 60 * 72
+    )
     result.data.raw_url = `${
       headers.origin || (headers['x-forwarded-proto'] || ctx.protocol) + '://' + ctx.req.selfHost
-    }/redirect/${key}?decode=1&lastUrl=${encodeURIComponent(path)}`
+    }/redirect/${key}?decode=1&lastUrl=${encodeURIComponent(virtualPath)}`
     if (result.data.provider === 'AliyundriveOpen') result.data.provider = 'Local'
   }
   ctx.body = result
@@ -301,7 +416,13 @@ proxyRouter.put('/api/fs/put-back', async (ctx, next) => {
   const uploadPath = headers['file-path'] ? decodeURIComponent(headers['file-path']) : '/-'
   const { passwdInfo } = pathFindPasswd(webdavConfig.passwdList, uploadPath)
   if (passwdInfo) {
-    const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize)
+    const originalName = path.basename(uploadPath)
+    request.passwdInfo = passwdInfo
+    setUploadPackageSize(request, passwdInfo, request.fileSize, originalName)
+    const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize, {
+      originalName,
+      zipMode: passwdInfo.zipMode,
+    })
     return await httpProxy(ctx.req, ctx.res, flowEnc.encryptTransform())
   }
   return await httpProxy(ctx.req, ctx.res)
@@ -338,6 +459,10 @@ app.use(proxyRouter.routes()).use(proxyRouter.allowedMethods())
 // 配置创建好了，就启动 else {
 const server = http.createServer(app.callback())
 server.maxConnections = 1000
+server.timeout = 0
+server.requestTimeout = 0
+server.headersTimeout = 0
+server.keepAliveTimeout = 0
 server.listen(port, () => logger.info('服务启动成功: ' + port))
 setInterval(() => {
   logger.debug('server_connections', server._connections, Date.now())

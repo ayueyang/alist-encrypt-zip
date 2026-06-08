@@ -4,7 +4,8 @@ import path from 'path'
 
 import mkdirp from 'mkdirp'
 import FlowEnc from './flowEnc'
-import { encodeName, decodeName } from './commonUtil'
+import { convertRealName, convertShowName, encodeName, decodeName } from './commonUtil'
+import { isZipEncType, parseZipInfoFromFile } from './zipPackageEnc'
 
 export function searchFile(filePath: string) {
   const fileArray: { size: number; filePath: string }[] = []
@@ -30,7 +31,8 @@ export async function encryptFile(
   enc: 'enc' | 'dec',
   encPath: string,
   outPath?: string,
-  encName?: boolean | string
+  encName?: boolean | string,
+  zipMode?: string
 ) {
   const start = Date.now()
   const interval = setInterval(() => {
@@ -63,13 +65,22 @@ export async function encryptFile(
       ext = path.extname(relativePath),
       childPath = path.dirname(relativePath)
     if (enc === 'enc' && encName) {
-      const newFileName = encodeName(password, encType, fileName) + ext
+      const newFileName = isZipEncType(encType) ? convertRealName(password, encType, fileName) : encodeName(password, encType, fileName) + ext
       relativePath = path.join(childPath, newFileName)
     }
     if (enc === 'dec' && encName) {
-      const newFileName = decodeName(password, encType, ext !== '' ? fileName.substring(0, fileName.length - ext.length) : fileName)
+      const newFileName = isZipEncType(encType)
+        ? convertShowName(password, encType, fileName)
+        : decodeName(password, encType, ext !== '' ? fileName.substring(0, fileName.length - ext.length) : fileName)
       if (newFileName) {
         relativePath = path.join(childPath, newFileName)
+      }
+    }
+    let zipInfo: any = null
+    if (enc === 'dec' && isZipEncType(encType)) {
+      zipInfo = await parseZipInfoFromFile(filePath)
+      if (!encName && zipInfo.origName) {
+        relativePath = path.join(childPath, zipInfo.origName)
       }
     }
     const outFilePath = path.join(outPath, relativePath)
@@ -80,10 +91,21 @@ export async function encryptFile(
     if (size === 0) {
       continue
     }
-    const flowEnc = new FlowEnc(password, encType, size)
+    const flowOptions: any = { originalName: fileName, zipMode }
+    let flowSize = size
+    let readStart = 0
+    if (enc === 'dec' && isZipEncType(encType)) {
+      flowOptions.zipInfo = zipInfo
+      flowSize = zipInfo.plainSize
+      readStart = zipInfo.payloadOffset
+    }
+    const flowEnc = new FlowEnc(password, encType, flowSize, flowOptions)
+    if (enc === 'dec' && isZipEncType(encType)) {
+      await flowEnc.setPosition(0)
+    }
     // console.log('@@outFilePath', outFilePath, encType, size)
     const writeStream = fs.createWriteStream(outFilePathTemp)
-    const readStream = fs.createReadStream(filePath)
+    const readStream = fs.createReadStream(filePath, isZipEncType(encType) && enc === 'dec' ? { start: readStart, end: readStart + flowSize - 1 } : undefined)
     const promise = new Promise<void>((resolve, reject) => {
       readStream.pipe(enc === 'enc' ? flowEnc.encryptTransform() : flowEnc.decryptTransform()).pipe(writeStream)
       readStream.on('end', () => {
@@ -104,7 +126,7 @@ export async function encryptFile(
   clearInterval(interval)
 }
 
-export function convertFile(...args: [password: string, encType: string, enc: 'enc' | 'dec', encPath: string, outPath?: string, encName?: string]) {
+export function convertFile(...args: [password: string, encType: string, enc: 'enc' | 'dec', encPath: string, outPath?: string, encName?: string, zipMode?: string]) {
   const statTime = Date.now()
   if (args.length > 3) {
     encryptFile(...args).then(() => {

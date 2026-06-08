@@ -6,6 +6,7 @@ import { logger } from './common/logger'
 import path from 'path'
 import { httpClient } from './utils/httpClient'
 import { XMLParser } from 'fast-xml-parser'
+import ZipPackageEnc, { isZipEncType } from './utils/zipPackageEnc'
 // import { escape } from 'querystring'
 
 async function sleep(time) {
@@ -147,6 +148,7 @@ const handle = async (ctx, next) => {
     // check dir, convert url
     const fileName = path.basename(url)
     const realName = convertRealName(passwdInfo.password, passwdInfo.encType, url)
+    request.zipVirtualName = fileName
     // maybe from aliyundrive, check this req url while get file list from enc folder
     if (url.endsWith('/') && 'GET,DELETE'.includes(request.method.toLocaleUpperCase())) {
       let respBody = await httpClient(ctx.req, ctx.res)
@@ -177,6 +179,13 @@ const handle = async (ctx, next) => {
     // cache file before upload in next(), rclone cmd 'copy' will PROPFIND this file when the file upload success right now
     const contentLength = request.headers['content-length'] || request.headers['x-expected-entity-length'] || 0
     const fileDetail = { path: url, name: fileName, is_dir: false, size: contentLength }
+    if (realName !== fileName) {
+      const realSize = isZipEncType(passwdInfo.encType)
+        ? ZipPackageEnc.packageSize(Number(contentLength) || 0, { originalName: fileName, zipMode: passwdInfo.zipMode })
+        : contentLength
+      const realFileDetail = { path: request.url, name: realName, is_dir: false, size: realSize }
+      await cacheFileInfo(realFileDetail)
+    }
     logger.info('@@@put url', url)
     // 在页面上传文件，rclone会重复上传，所以要进行缓存文件信息，也不能在next() 因为rclone copy命令会出异常
     await cacheFileInfo(fileDetail)

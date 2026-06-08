@@ -7,23 +7,90 @@ import Crcn from './crc6-8'
 
 const crc6 = new Crcn(6)
 const origPrefix = 'orig_'
+const zipEncType = 'zip'
+const zipSuffix = '.zip'
+const videoExts = new Set([
+  '.mp4',
+  '.m4v',
+  '.webm',
+  '.mkv',
+  '.avi',
+  '.mov',
+  '.flv',
+  '.wmv',
+  '.ts',
+  '.mpg',
+  '.mpeg',
+  '.3gp',
+  '.m2ts',
+])
+const audioExts = new Set(['.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg', '.opus', '.wma'])
+const imageExts = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.ico', '.heic', '.avif'])
+
+function safeDecodeURIComponent(text: string) {
+  try {
+    return decodeURIComponent(text)
+  } catch (e) {
+    return text
+  }
+}
+
+export function encodeZipStorageName(password: string, encType: string, plainName: string) {
+  const decodedName = safeDecodeURIComponent(plainName || '')
+  const ext = path.extname(decodedName)
+  return encodeName(password, encType, decodedName) + ext + zipSuffix
+}
+
+export function decodeZipStorageName(password: string, encType: string, storageName: string) {
+  if (encType !== zipEncType) {
+    return null
+  }
+  const decodedStorageName = safeDecodeURIComponent(storageName || '')
+  if (!decodedStorageName.toLocaleLowerCase().endsWith(zipSuffix)) {
+    return null
+  }
+  const withoutZip = decodedStorageName.substring(0, decodedStorageName.length - zipSuffix.length)
+  const visibleExt = path.extname(withoutZip)
+  const cipherName = visibleExt ? withoutZip.substring(0, withoutZip.length - visibleExt.length) : withoutZip
+  if (!cipherName) {
+    return null
+  }
+  const showName = decodeName(password, encType, cipherName)
+  if (!showName) {
+    return null
+  }
+  const showExt = path.extname(showName)
+  if (visibleExt && showExt && visibleExt.toLocaleLowerCase() !== showExt.toLocaleLowerCase()) {
+    return null
+  }
+  return showName
+}
 
 // check file name, return real name
 export function convertRealName(password: string, encType: string, pathText: string) {
-  const fileName = path.basename(pathText)
+  const fileName = path.basename(safeDecodeURIComponent(pathText))
   if (fileName.indexOf(origPrefix) === 0) {
     return fileName.replace(origPrefix, '')
   }
+  if (encType === zipEncType) {
+    if (decodeZipStorageName(password, encType, fileName)) {
+      return fileName
+    }
+    return encodeZipStorageName(password, encType, fileName)
+  }
   // try encode name, fileName don't need decodeURI，encodeUrl func can't encode that like '(' '!'  in nodejs
   const ext = path.extname(fileName)
-  const encName = encodeName(password, encType, decodeURIComponent(fileName))
-  console.log('@@decodeURI(fileName)', decodeURIComponent(fileName))
+  const encName = encodeName(password, encType, safeDecodeURIComponent(fileName))
+  console.log('@@decodeURI(fileName)', safeDecodeURIComponent(fileName))
   return encName + ext
 }
 
 // if file name has encrypt, return show name
 export function convertShowName(password: string, encType: string, pathText: string) {
-  const fileName = path.basename(decodeURIComponent(pathText))
+  const fileName = path.basename(safeDecodeURIComponent(pathText))
+  if (encType === zipEncType) {
+    return decodeZipStorageName(password, encType, fileName) || fileName
+  }
   const ext = path.extname(fileName)
   const encName = fileName.replace(ext, '')
   // encName don't need decodeURI
@@ -32,6 +99,20 @@ export function convertShowName(password: string, encType: string, pathText: str
     showName = origPrefix + fileName
   }
   return showName
+}
+
+export function inferAListType(fileName: string, fallbackType = 0) {
+  const ext = path.extname(safeDecodeURIComponent(fileName || '')).toLocaleLowerCase()
+  if (videoExts.has(ext)) {
+    return 2
+  }
+  if (audioExts.has(ext)) {
+    return 3
+  }
+  if (imageExts.has(ext)) {
+    return 5
+  }
+  return fallbackType
 }
 
 // 判断是否为匹配的路径

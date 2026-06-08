@@ -34,6 +34,7 @@ const alistServerTemp = {
       password: '123456',
       describe: 'my video', // 加密内容描述
       encType: 'aesctr', // 算法类型，可选mix，rc4，默认aesctr
+      zipMode: 'compatible',
       enable: true, // enable encrypt
       encName: false, // encrypt file name
       encSuffix: '', //
@@ -58,6 +59,7 @@ const webdavServerTemp = [
         password: '123456',
         encType: 'aesctr', // 密码类型，mix：速度更快适合电视盒子之类，rc4: 更安全，速度比mix慢一点，几乎无感知。
         describe: 'my video',
+        zipMode: 'compatible',
         enable: false,
         encName: false, // encrypt file name
         encNameSuffix: '', //
