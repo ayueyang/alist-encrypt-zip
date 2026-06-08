@@ -22,11 +22,12 @@
       <div v-for="(item, index) in alistConfigForm.passwdList" :key="item.id">
         配置 {{ index + 1 }}
         <el-form-item label="算法">
-          <el-radio-group v-model="item.encType" style="margin: 0px 5px" size="small">
+          <el-radio-group :model-value="getEncChoice(item)" style="margin: 0px 5px" size="small" @update:model-value="value => setEncChoice(item, value)">
             <!-- <el-radio label="mix" border>MIX</el-radio> -->
             <el-radio label="aesctr" border>AES-CTR</el-radio>
             <el-radio label="rc4" border>RC4</el-radio>
-            <el-radio label="zip" border>ZIP包</el-radio>
+            <el-radio label="zip-compatible" border>真ZIP</el-radio>
+            <el-radio label="zip-fake" border>伪装ZIP</el-radio>
           </el-radio-group>
           开启
           <el-switch v-model="item.enable" class="ml-2" style="--el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949" />
@@ -38,10 +39,6 @@
         <el-form-item label="文件名">
           加密
           <el-switch v-model="item.encName" class="ml-2" style="margin-right: 10px; --el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949" />
-          <el-radio-group v-if="item.encType === 'zip'" v-model="item.zipMode" size="small" style="margin-left: 10px">
-            <el-radio label="compatible" border>Compatible</el-radio>
-            <el-radio label="fake" border>Fake</el-radio>
-          </el-radio-group>
           <!-- 后缀
           <el-input v-model="item.encSuffix" style="max-width: 150px; margin-left: 10px" placeholder="默认原文件名后缀" /> -->
         </el-form-item>
@@ -73,7 +70,7 @@
                   <!-- <el-radio label="mix" border>MIX</el-radio> -->
                   <el-radio label="aesctr" border>AES-CTR</el-radio>
                   <el-radio label="rc4" border>RC4</el-radio>
-                  <el-radio label="zip" border>ZIP包</el-radio>
+                  <el-radio label="zip" border>ZIP包(真ZIP)</el-radio>
                 </el-radio-group>
               </el-form-item>
               <el-form-item prop="username" label="文件夹密码">
@@ -158,6 +155,28 @@ const alistConfigForm = reactive({
   ]
 })
 const refSearchForm = $ref()
+const getEncChoice = (item) => {
+  if (item.encType === 'zip') {
+    return item.zipMode === 'fake' ? 'zip-fake' : 'zip-compatible'
+  }
+  return item.encType
+}
+
+const setEncChoice = (item, value) => {
+  if (value === 'zip-compatible') {
+    item.encType = 'zip'
+    item.zipMode = 'compatible'
+    return
+  }
+  if (value === 'zip-fake') {
+    item.encType = 'zip'
+    item.zipMode = 'fake'
+    return
+  }
+  item.encType = value
+  item.zipMode = item.zipMode || 'compatible'
+}
+
 // 添加密码配置
 const addPasswd = () => {
   alistConfigForm.passwdList.push({

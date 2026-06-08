@@ -16,11 +16,12 @@
         </el-radio-group>
       </el-form-item>
       <el-form-item label="算法">
-        <el-radio-group v-model="folderForm.encType" size="small">
+        <el-radio-group :model-value="getEncChoice(folderForm)" size="small" @update:model-value="value => setEncChoice(folderForm, value)">
           <!-- <el-radio label="mix" border>MIX</el-radio> -->
           <el-radio label="aesctr" border>AES-CTR</el-radio>
           <el-radio label="rc4" border>RC4</el-radio>
-          <el-radio label="zip" border>ZIP包</el-radio>
+          <el-radio label="zip-compatible" border>真ZIP</el-radio>
+          <el-radio label="zip-fake" border>伪装ZIP</el-radio>
         </el-radio-group>
       </el-form-item>
       <el-form-item label="密码">
@@ -79,6 +80,7 @@ const folderForm = reactive({
   folderPath: folderInfo.folderPath,
   outPath: folderInfo.outPath,
   encType: 'aesctr',
+  zipMode: 'compatible',
   password: '123456', // 文件夹密码
   operation: 'enc',
   encName: false
@@ -86,6 +88,27 @@ const folderForm = reactive({
 
 const alistConfigForm = reactive({})
 const refSearchForm = $ref()
+const getEncChoice = (item) => {
+  if (item.encType === 'zip') {
+    return item.zipMode === 'fake' ? 'zip-fake' : 'zip-compatible'
+  }
+  return item.encType
+}
+
+const setEncChoice = (item, value) => {
+  if (value === 'zip-compatible') {
+    item.encType = 'zip'
+    item.zipMode = 'compatible'
+    return
+  }
+  if (value === 'zip-fake') {
+    item.encType = 'zip'
+    item.zipMode = 'fake'
+    return
+  }
+  item.encType = value
+  item.zipMode = item.zipMode || 'compatible'
+}
 
 const delPasswd = (index) => {
   alistConfigForm.passwdList.splice(index, 1)
