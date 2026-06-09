@@ -558,6 +558,21 @@ function parseCustomExtra(extra) {
   throw new Error('zip package extra field is not recognized')
 }
 
+function tryParseCustomExtra(extra) {
+  try {
+    return parseCustomExtra(extra)
+  } catch (e) {
+    return null
+  }
+}
+
+function winZipAesSaltSize(strength) {
+  if (strength === 1) return 8
+  if (strength === 2) return 12
+  if (strength === 3) return 16
+  throw new Error('unsupported WinZip AES strength')
+}
+
 function parseZip64Sizes(extra, need) {
   const result = {}
   const field = parseExtraFields(extra).find((item) => item.id === ZIP64_EXTRA_ID)
@@ -879,12 +894,13 @@ async function parseEocd(tail, tailStart, readRange) {
     throw new Error('zip package EOCD not found')
   }
   const eocd = tail.subarray(pos, pos + 22)
+  let entryCount = eocd.readUInt16LE(10)
   let centralSize = eocd.readUInt32LE(12)
   let centralOffset = eocd.readUInt32LE(16)
   const needsZip64 = centralSize === ZIP32_MAX || centralOffset === ZIP32_MAX || eocd.readUInt16LE(8) === 0xffff
 
   if (!needsZip64) {
-    return { centralOffset, centralSize }
+    return { centralOffset, centralSize, entryCount }
   }
 
   const locatorSig = Buffer.from([0x50, 0x4b, 0x06, 0x07])
@@ -903,9 +919,10 @@ async function parseEocd(tail, tailStart, readRange) {
   if (zip64Eocd.readUInt32LE(0) !== 0x06064b50) {
     throw new Error('zip64 EOCD is invalid')
   }
+  entryCount = readUInt64LE(zip64Eocd, 32)
   centralSize = readUInt64LE(zip64Eocd, 40)
   centralOffset = readUInt64LE(zip64Eocd, 48)
-  return { centralOffset, centralSize }
+  return { centralOffset, centralSize, entryCount }
 }
 
 function parseLocalHeaderBytes(fixed, rest) {
@@ -989,36 +1006,58 @@ export async function parseZipInfoFromReader(readRange, totalSize, options = {})
   const tailSize = Math.min(65536 + 128, totalSize)
   const tailStart = Math.max(0, totalSize - tailSize)
   const tail = await readRange(tailStart, totalSize - tailStart)
-  const { centralOffset } = await parseEocd(tail, tailStart, readRange)
+  const { centralOffset, entryCount } = await parseEocd(tail, tailStart, readRange)
   const central = await parseCentralDirectory(readRange, centralOffset)
-  const custom = parseCustomExtra(central.extra.length ? central.extra : local.extra)
-  const customMeta = custom.meta && custom.meta.length ? decryptMeta(options.password, custom.meta) : null
   const winZipAes = parseWinZipAesExtra(central.extra.length ? central.extra : local.extra)
+  const custom = tryParseCustomExtra(central.extra.length ? central.extra : local.extra)
+  if (!custom && !winZipAes) {
+    throw new Error('zip package extra field is not recognized')
+  }
+  if (!custom && winZipAes) {
+    if (entryCount !== 1) {
+      throw new Error('standard WinZip AES package must contain exactly one file for playback')
+    }
+    if (fixed.readUInt16LE(8) !== WINZIP_AES_METHOD) {
+      throw new Error('standard WinZip AES package method is invalid')
+    }
+    if (winZipAes.actualMethod !== STORE_METHOD) {
+      throw new Error('standard WinZip AES package must use store method for random playback')
+    }
+  }
+  const customMeta = custom && custom.meta && custom.meta.length ? decryptMeta(options.password, custom.meta) : null
   const zipMode = winZipAes ? ZIP_MODE_WINZIP_AES : normalizeZipMode(custom.zipMode)
   const plainSize = central.uncompressedSize
   const compressedSize = central.compressedSize
+  const winZipAesDataHeaderSize = winZipAes ? winZipAesSaltSize(winZipAes.strength) + WINZIP_AES_VERIFY_SIZE : 0
   const dataHeaderSize =
     zipMode === ZIP_MODE_COMPATIBLE
       ? ZIPCRYPTO_HEADER_SIZE
       : zipMode === ZIP_MODE_WINZIP_AES
-        ? WINZIP_AES_SALT_SIZE + WINZIP_AES_VERIFY_SIZE
+        ? winZipAesDataHeaderSize
         : 0
   const authSize = zipMode === ZIP_MODE_WINZIP_AES ? WINZIP_AES_AUTH_SIZE : 0
+  if (!custom && zipMode === ZIP_MODE_WINZIP_AES && compressedSize - dataHeaderSize - authSize !== plainSize) {
+    throw new Error('standard WinZip AES package size is not store-compatible')
+  }
+  const winZipAesSalt =
+    zipMode === ZIP_MODE_WINZIP_AES && winZipAes
+      ? (custom?.salt || (await readRange(local.headerSize, winZipAesSaltSize(winZipAes.strength))))
+      : undefined
 
   return {
     encType: ZIP_ENC_TYPE,
     zipMode,
-    version: custom.version,
-    mode: custom.mode,
-    origName: customMeta?.origName || custom.origName || null,
+    version: custom?.version || 0,
+    mode: custom?.mode ?? MODE_WINZIP_AES,
+    origName: customMeta?.origName || custom?.origName || null,
     innerName: customMeta?.innerName || central.name || local.name || INNER_FILENAME,
-    salt: custom.salt,
-    nonce: custom.nonce,
-    meta: custom.meta,
+    salt: winZipAesSalt || custom?.salt,
+    nonce: custom?.nonce,
+    meta: custom?.meta,
     metaInfo: customMeta,
     winZipAes,
-    checkpoints: custom.checkpoints || [],
-    cpInterval: custom.cpInterval || 0,
+    checkpoints: custom?.checkpoints || [],
+    cpInterval: custom?.cpInterval || 0,
     headerSize: local.headerSize,
     encryptedHeaderOffset: local.headerSize,
     payloadOffset: local.headerSize + dataHeaderSize,
@@ -1048,7 +1087,12 @@ export async function parseZipInfoFromFile(filePath, options = {}) {
 
 export async function parseZipInfoFromRemote(urlAddr, headers = {}, candidateSize = 0, options = {}) {
   const totalSize = await getRemoteSize(urlAddr, headers, Number(candidateSize) || 0)
-  const readRange = (start, length) => readRemoteRange(urlAddr, headers, start, length)
+  const readRange = (start, length) => {
+    if (typeof options.onReadRange === 'function') {
+      options.onReadRange(start, length)
+    }
+    return readRemoteRange(urlAddr, headers, start, length)
+  }
   return await parseZipInfoFromReader(readRange, totalSize, options)
 }
 

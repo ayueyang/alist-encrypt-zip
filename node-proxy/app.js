@@ -16,13 +16,6 @@ import { httpProxy, httpClient } from '@/utils/httpClient'
 import bodyparser from 'koa-bodyparser'
 import FlowEnc from '@/utils/flowEnc'
 import ZipPackageEnc, { isZipEncType, parseZipInfoFromRemote, prepareZipDownloadRequest } from '@/utils/zipPackageEnc'
-import {
-  canServeZipCacheRange,
-  getZipCacheEntry,
-  serveZipCacheRange,
-  startZipCacheDownload,
-  zipCacheKey,
-} from '@/utils/zipDiskCache'
 import levelDB from '@/utils/levelDB'
 import { webdavServer, alistServer, port, version } from '@/config'
 import { convertRealName, pathExec, pathFindPasswd } from '@/utils/commonUtil'
@@ -32,6 +25,13 @@ import encNameRouter from '@/encNameRouter'
 import encDavHandle from '@/encDavHandle'
 
 import { cacheFileInfo, getFileInfo } from '@/dao/fileDao'
+import {
+  cacheZipInfo,
+  deserializeZipInfo,
+  getCachedZipInfo,
+  serializeZipInfo,
+  zipInfoValidator,
+} from '@/dao/zipInfoDao'
 import { getWebdavFileInfo } from '@/utils/webdavClient'
 import staticServer from 'koa-static'
 import { logger } from '@/common/logger'
@@ -55,42 +55,50 @@ function setUploadPackageSize(request, passwdInfo, plainSize, originalName) {
   delete request.headers['x-expected-entity-length']
 }
 
-function serializeZipInfo(zipInfo) {
-  if (!zipInfo) return null
-  return {
-    ...zipInfo,
-    salt: zipInfo.salt ? Buffer.from(zipInfo.salt).toString('hex') : undefined,
-    nonce: zipInfo.nonce ? Buffer.from(zipInfo.nonce).toString('hex') : undefined,
-    meta: zipInfo.meta ? Buffer.from(zipInfo.meta).toString('hex') : undefined,
+async function readZipInfoWithFieldCache({ request, passwdInfo, sourceSize, rangeHeader, cachedZipInfo = null, realPath, fileInfo = null, urlAddr }) {
+  const validator = zipInfoValidator(fileInfo, sourceSize)
+  const cachePath = realPath || request.zipRealPath || request.url
+  let zipInfo = cachedZipInfo
+  if (!zipInfo && cachePath) {
+    zipInfo = await getCachedZipInfo({ realPath: cachePath, passwdInfo, validator })
+    if (zipInfo) {
+      logger.info('@@zipInfo field cache hit', cachePath, {
+        zipMode: zipInfo.zipMode,
+        plainSize: zipInfo.plainSize,
+        payloadOffset: zipInfo.payloadOffset,
+      })
+    }
   }
+  if (!zipInfo) {
+    const ranges = []
+    zipInfo = await parseZipInfoFromRemote(urlAddr || request.urlAddr, request.headers, sourceSize, {
+      password: passwdInfo.password,
+      onReadRange(start, length) {
+        ranges.push(`${start}-${start + length - 1}`)
+      },
+    })
+    if (cachePath) {
+      await cacheZipInfo({ realPath: cachePath, passwdInfo, validator, zipInfo })
+      logger.info('@@zipInfo field cache store', cachePath, {
+        ranges,
+        zipMode: zipInfo.zipMode,
+        plainSize: zipInfo.plainSize,
+        payloadOffset: zipInfo.payloadOffset,
+      })
+    }
+  }
+  return zipInfo
 }
 
-function deserializeZipInfo(zipInfo) {
-  if (!zipInfo) return null
-  return {
-    ...zipInfo,
-    salt: zipInfo.salt ? Buffer.from(zipInfo.salt, 'hex') : undefined,
-    nonce: zipInfo.nonce ? Buffer.from(zipInfo.nonce, 'hex') : undefined,
-    meta: zipInfo.meta ? Buffer.from(zipInfo.meta, 'hex') : undefined,
-  }
-}
-
-function getZipCacheHeaders(headers, urlAddr) {
-  const next = { ...headers }
-  delete next.host
-  delete next.referer
-  delete next.authorization
-  delete next.range
-  delete next['content-length']
-  delete next['accept-encoding']
-  if (urlAddr && urlAddr.indexOf('baidupcs.com') >= 0) {
-    next['User-Agent'] = 'pan.baidu.com'
-  }
-  return next
-}
-
-async function prepareZipDecrypt(request, passwdInfo, sourceSize, rangeHeader, cachedZipInfo = null) {
-  const zipInfo = cachedZipInfo || (await parseZipInfoFromRemote(request.urlAddr, request.headers, sourceSize, { password: passwdInfo.password }))
+async function prepareZipDecrypt(request, passwdInfo, sourceSize, rangeHeader, cachedZipInfo = null, cacheOptions = {}) {
+  const zipInfo = await readZipInfoWithFieldCache({
+    request,
+    passwdInfo,
+    sourceSize,
+    rangeHeader,
+    cachedZipInfo,
+    ...cacheOptions,
+  })
   request.zipVirtualName = request.zipVirtualName || path.basename(decodeURIComponent(request.url.split('?')[0] || zipInfo.innerName))
   prepareZipDownloadRequest(request, zipInfo, rangeHeader)
   const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, zipInfo.plainSize, { zipInfo })
@@ -125,7 +133,7 @@ proxyRouter.all('/redirect/:key', async (ctx) => {
     ctx.body = 'no found'
     return
   }
-  const { passwdInfo, redirectUrl, fileSize, virtualName, zipInfo: cachedZipInfoData, zipCacheId } = data
+  const { passwdInfo, redirectUrl, fileSize, virtualName, zipInfo: cachedZipInfoData, realPath } = data
   // 要定位请求文件的位置 bytes=98304-
   const range = request.headers.range
   const start = range ? range.replace('bytes=', '').split('-')[0] * 1 : 0
@@ -142,6 +150,7 @@ proxyRouter.all('/redirect/:key', async (ctx) => {
   delete request.headers.referer
   request.passwdInfo = passwdInfo
   request.zipVirtualName = virtualName
+  request.zipRealPath = realPath
   // 123网盘和天翼网盘多次302
   request.fileSize = fileSize
   // authorization 是alist网页版的token，不是webdav的，这里修复天翼云无法获取资源的问题
@@ -156,7 +165,7 @@ proxyRouter.all('/redirect/:key', async (ctx) => {
   if (shouldDecode) {
     let flowEnc = null
     if (isZipEncType(passwdInfo.encType)) {
-      flowEnc = await prepareZipDecrypt(request, passwdInfo, fileSize, range, deserializeZipInfo(cachedZipInfoData))
+      flowEnc = await prepareZipDecrypt(request, passwdInfo, fileSize, range, deserializeZipInfo(cachedZipInfoData), { realPath })
     } else {
       flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, fileSize)
       if (start) {
@@ -166,16 +175,6 @@ proxyRouter.all('/redirect/:key', async (ctx) => {
     decryptTransform = flowEnc.decryptTransform()
   }
   // 请求实际服务资源
-  if (shouldDecode && isZipEncType(passwdInfo.encType) && zipCacheId && request.zipPackageRange) {
-    const cacheEntry = getZipCacheEntry(zipCacheId, fileSize)
-    startZipCacheDownload(cacheEntry, redirectUrl, getZipCacheHeaders(request.headers, redirectUrl))
-    if (canServeZipCacheRange(cacheEntry, request.zipPackageRange)) {
-      await serveZipCacheRange(response, request, cacheEntry, decryptTransform)
-      logger.info('----finish redirect cache---', decode, request.urlAddr)
-      return
-    }
-    response.setHeader('x-zip-cache', 'miss')
-  }
   await httpProxy(request, response, null, decryptTransform)
   logger.info('----finish redirect---', decode, request.urlAddr, decryptTransform === null)
 })
@@ -343,16 +342,16 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     logger.info('@@getFile ', path, ctx.req.reqBody, result)
     const remoteFileSize = result.data.size
     let zipInfo = null
-    let zipCacheId = null
     if (isZipEncType(passwdInfo.encType)) {
-      zipInfo = await parseZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize, { password: passwdInfo.password })
+      zipInfo = await readZipInfoWithFieldCache({
+        request: ctx.req,
+        passwdInfo,
+        sourceSize: remoteFileSize,
+        realPath: path,
+        fileInfo: result.data,
+        urlAddr: result.data.raw_url,
+      })
       result.data.size = zipInfo.plainSize
-      zipCacheId = zipCacheKey({ virtualPath, redirectUrl: result.data.raw_url, fileSize: remoteFileSize, passwdInfo })
-      startZipCacheDownload(
-        getZipCacheEntry(zipCacheId, remoteFileSize),
-        result.data.raw_url,
-        getZipCacheHeaders(ctx.req.headers, result.data.raw_url)
-      )
     }
     const key = crypto.randomUUID()
     await levelDB.setExpire(key, { redirectUrl: result.data.raw_url, passwdInfo, fileSize: remoteFileSize }, 60 * 60 * 72) // 缓存起来，默认3天，足够下载和观看了
@@ -363,8 +362,8 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
         passwdInfo,
         fileSize: remoteFileSize,
         virtualName: decodeURIComponent(virtualPath.split('/').pop() || ''),
+        realPath: path,
         zipInfo: serializeZipInfo(zipInfo),
-        zipCacheId,
       },
       60 * 60 * 72
     )

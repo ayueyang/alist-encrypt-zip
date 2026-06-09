@@ -5,6 +5,7 @@ import levelDB from './levelDB'
 import path from 'path'
 import { convertShowName } from './commonUtil'
 import { applyZipResponseHeaders } from './zipPackageEnc'
+import { serializeZipInfo } from '../dao/zipInfoDao'
 // import { pathExec } from './commonUtil'
 const Agent = http.Agent
 const Agents = https.Agent
@@ -39,9 +40,18 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
           console.log()
           await levelDB.setExpire(key, { redirectUrl, passwdInfo, fileSize }, 60 * 60 * 72) // 缓存起来，默认3天，足够下载和观看了
           // 、Referer
-          if (request.zipVirtualName) {
-            await levelDB.setExpire(key, { redirectUrl, passwdInfo, fileSize, virtualName: request.zipVirtualName }, 60 * 60 * 72)
-          }
+          await levelDB.setExpire(
+            key,
+            {
+              redirectUrl,
+              passwdInfo,
+              fileSize,
+              virtualName: request.zipVirtualName,
+              realPath: request.zipRealPath,
+              zipInfo: serializeZipInfo(request.zipInfo),
+            },
+            60 * 60 * 72
+          )
           httpResp.headers.location = `/redirect/${key}?decode=1&lastUrl=${encodeURIComponent(url)}`
         }
         console.log('302 redirectUrl:', redirectUrl)

@@ -37,6 +37,34 @@ function readFileRange(filePath, start, end) {
   return fs.readFileSync(filePath).subarray(start, end + 1)
 }
 
+function hasExtraField(extra, fieldId) {
+  let offset = 0
+  while (offset + 4 <= extra.length) {
+    const id = extra.readUInt16LE(offset)
+    const size = extra.readUInt16LE(offset + 2)
+    if (offset + 4 + size > extra.length) break
+    if (id === fieldId) return true
+    offset += 4 + size
+  }
+  return false
+}
+
+function readFirstLocalExtra(filePath) {
+  const fd = fs.openSync(filePath, 'r')
+  try {
+    const fixed = Buffer.alloc(30)
+    fs.readSync(fd, fixed, 0, fixed.length, 0)
+    assert.strictEqual(fixed.readUInt32LE(0), 0x04034b50)
+    const nameLen = fixed.readUInt16LE(26)
+    const extraLen = fixed.readUInt16LE(28)
+    const extra = Buffer.alloc(extraLen)
+    fs.readSync(fd, extra, 0, extraLen, 30 + nameLen)
+    return extra
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 async function decryptRange(filePath, rangeHeader) {
   const zipInfo = await parseZipInfoFromFile(filePath)
   const request = { method: 'GET', headers: {}, zipVirtualName: '测试 视频.final.mp4' }
@@ -133,6 +161,54 @@ async function verifyMode(zipMode) {
   }
 }
 
+async function verifyNativeWinZipAesStore() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'alist-native-aes-test-'))
+  const originalName = 'external-tool.mp4'
+  const plain = Buffer.concat([
+    Buffer.from('ftypisom'),
+    crypto.randomBytes(384 * 1024 + 91),
+    Buffer.from('native-winzip-aes-tail'),
+  ])
+  const plainPath = path.join(tempDir, originalName)
+  const zipPath = path.join(tempDir, 'native-winzip-aes-store.zip')
+  fs.writeFileSync(plainPath, plain)
+
+  const createScript = [
+    'import pathlib, sys, zipfile, pyzipper',
+    'plain_path = pathlib.Path(sys.argv[1])',
+    'zip_path = pathlib.Path(sys.argv[2])',
+    'with pyzipper.AESZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:',
+    "    zf.setpassword(b'admin123')",
+    '    zf.setencryption(pyzipper.WZ_AES, nbits=256)',
+    '    zf.write(plain_path, arcname=plain_path.name)',
+  ].join('\n')
+  childProcess.execFileSync('python', ['-c', createScript, plainPath, zipPath], { stdio: 'pipe' })
+
+  assert.ok(!hasExtraField(readFirstLocalExtra(zipPath), 0x5a46), 'native WinZip AES sample must not contain custom FZ extra field')
+
+  const zipInfo = await parseZipInfoFromFile(zipPath, { password })
+  assert.strictEqual(zipInfo.zipMode, ZIP_MODE_WINZIP_AES)
+  assert.strictEqual(zipInfo.innerName, originalName)
+  assert.strictEqual(zipInfo.origName, null)
+  assert.strictEqual(zipInfo.plainSize, plain.length)
+  assert.strictEqual(zipInfo.winZipAes.actualMethod, 0)
+  assert.strictEqual(zipInfo.authSize, 10)
+  assert.ok(Buffer.isBuffer(zipInfo.salt))
+  assert.strictEqual(zipInfo.salt.length, 16)
+  assert.strictEqual(zipInfo.compressedSize, plain.length + 28)
+
+  const ranges = [
+    [0, 63],
+    [7, 4095],
+    [Math.floor(plain.length / 2) - 13, Math.floor(plain.length / 2) + 1024],
+    [plain.length - 2048, plain.length - 1],
+  ]
+  for (const [start, end] of ranges) {
+    const actual = await decryptRange(zipPath, `bytes=${start}-${end}`)
+    assert.deepStrictEqual(actual, plain.subarray(start, end + 1), `native winzip aes range ${start}-${end}`)
+  }
+}
+
 async function verifyNames() {
   const names = ['测试 视频.final.mp4', 'a b.c.d.mkv', 'noext', '普通.zip']
   for (const name of names) {
@@ -153,6 +229,7 @@ async function main() {
   await verifyMode(ZIP_MODE_COMPATIBLE)
   await verifyMode(ZIP_MODE_WINZIP_AES)
   await verifyMode(ZIP_MODE_FAKE)
+  await verifyNativeWinZipAesStore()
   console.log('zipPackageEncTest ok')
 }
 
