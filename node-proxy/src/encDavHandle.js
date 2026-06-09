@@ -109,6 +109,10 @@ function rewriteWebdavContentLength(respBody, fileInfo, plainSize) {
   )
 }
 
+function isWebdavFileRequest(url, fileName) {
+  return !url.endsWith('/') && !!path.extname(decodeURIComponent(fileName || ''))
+}
+
 // 拦截全部
 const handle = async (ctx, next) => {
   const request = ctx.req
@@ -127,7 +131,7 @@ const handle = async (ctx, next) => {
       const sourceFileInfo = await getFileInfo(sourceUrl)
       logger.debug('@@@sourceFileInfo', sourceFileInfo, reqFileName, realName, url, sourceUrl)
       // it is file, convert file name
-      if (sourceFileInfo && !sourceFileInfo.is_dir) {
+      if ((sourceFileInfo && !sourceFileInfo.is_dir) || isWebdavFileRequest(url, reqFileName)) {
         request.url = path.dirname(request.url) + '/' + realName
         request.urlAddr = path.dirname(request.urlAddr) + '/' + realName
       }
