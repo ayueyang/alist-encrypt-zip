@@ -17,7 +17,8 @@ import { httpClient, httpProxy } from './utils/httpClient'
 import FlowEnc from './utils/flowEnc'
 import { logger } from './common/logger'
 import { cacheFileInfo, getFileInfo } from './dao/fileDao'
-import WinZipAesZip, { isWinZipAesEncType, parseWinZipAesZipInfoFromRemote, serializeWinZipAesZipInfo } from './utils/winZipAesZip'
+import WinZipAesZip, { isWinZipAesEncType } from './utils/winZipAesZip'
+import { enqueueExternalWinZipAesZipProbe } from './utils/winZipAesZipCache'
 
 // bodyparser解析body
 const bodyparserMw = bodyparser({ enableTypes: ['json', 'form', 'text'] })
@@ -83,7 +84,7 @@ function joinUrlPath(dir, name) {
   return `${String(dir || '').replace(/\/$/, '')}/${name}`
 }
 
-async function prepareWinZipAesListFileInfo(fileInfo, request, passwdInfo) {
+function prepareWinZipAesListFileInfo(fileInfo, request, passwdInfo) {
   if (!isWinZipAesEncType(passwdInfo.encType) || fileInfo.is_dir || !String(fileInfo.name || '').toLowerCase().endsWith('.zip')) {
     return fileInfo
   }
@@ -93,39 +94,12 @@ async function prepareWinZipAesListFileInfo(fileInfo, request, passwdInfo) {
     fileInfo.type = getAListFileTypeByName(fileInfo.name)
     return fileInfo
   }
-  try {
-    const cachedFileInfo = await getFileInfo(fileInfo.path)
-    let zipInfo = cachedFileInfo && cachedFileInfo.zipInfo
-    let plainSize = cachedFileInfo && cachedFileInfo.plainSize
-    if (!zipInfo || !cachedFileInfo || Number(cachedFileInfo.size) !== Number(fileInfo.size)) {
-      const oldUrlAddr = request.urlAddr
-      let parsedZipInfo
-      try {
-        request.urlAddr = request.serverAddr + fileInfo.path
-        parsedZipInfo = await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, fileInfo.size)
-      } finally {
-        request.urlAddr = oldUrlAddr
-      }
-      zipInfo = serializeWinZipAesZipInfo(parsedZipInfo)
-      plainSize = parsedZipInfo.plainSize
-      await cacheFileInfo({
-        ...fileInfo,
-        size: fileInfo.size,
-        plainSize,
-        zipInfo,
-        externalZip: true,
-        zipVirtualName: fileInfo.name,
-      })
-    }
-    fileInfo.plainSize = plainSize
-    fileInfo.zipInfo = zipInfo
-    fileInfo.externalZip = true
-    fileInfo.type = getAListFileTypeByName(zipInfo.innerName)
-    if (plainSize !== undefined) {
-      fileInfo.size = plainSize
-    }
-  } catch (e) {
-    // Keep ordinary ZIP files untouched.
+  if (passwdInfo.zipAutoCache) {
+    enqueueExternalWinZipAesZipProbe({
+      fileInfo,
+      urlAddr: request.serverAddr + fileInfo.path,
+      headers: request.headers,
+    })
   }
   return fileInfo
 }
@@ -150,7 +124,7 @@ encNameRouter.all('/api/fs/list', async (ctx, next) => {
       //  Check path if the file name needs to be encrypted
       const { passwdInfo } = pathFindPasswd(passwdList, decodeURI(fileInfo.path))
       if (passwdInfo && passwdInfo.encName) {
-        await prepareWinZipAesListFileInfo(fileInfo, ctx.req, passwdInfo)
+        prepareWinZipAesListFileInfo(fileInfo, ctx.req, passwdInfo)
         if (!isWinZipAesEncType(passwdInfo.encType)) {
           fileInfo.name = convertShowName(passwdInfo.password, passwdInfo.encType, fileInfo.name)
         }
@@ -295,6 +269,7 @@ encNameRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
       ctx.req.isExternalZipCandidate = !ctx.req.isExternalZip && isRawZipName(passwdInfo, fileName)
       if (ctx.req.isExternalZip && fileInfo.zipInfo) {
         ctx.req.zipVirtualName = fileInfo.zipInfo.innerName
+        ctx.req.cachedExternalZipInfo = fileInfo.zipInfo
       }
     }
     //  Check if it is a directory

@@ -35,6 +35,11 @@ import { cacheFileInfo, getFileInfo } from '@/dao/fileDao'
 import { getWebdavFileInfo } from '@/utils/webdavClient'
 import staticServer from 'koa-static'
 import { logger } from '@/common/logger'
+import {
+  cacheExternalWinZipAesZipInfo,
+  cacheExternalWinZipAesZipNegative,
+  getWinZipAesZipProbeCache,
+} from '@/utils/winZipAesZipCache'
 
 async function sleep(time) {
   return new Promise((resolve) => {
@@ -72,6 +77,23 @@ async function prepareWinZipAesDecrypt(request, passwdInfo, zipSize, rangeHeader
   const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, zipInfo.plainSize, { zipInfo })
   await flowEnc.setPosition(request.zipCipherStart || 0)
   return flowEnc
+}
+
+async function prepareExternalWinZipAesZipInfo(request, fileInfo, parseUrl, headers, options = {}) {
+  const probeCache = await getWinZipAesZipProbeCache(fileInfo.path, fileInfo.size)
+  if (probeCache.type === 'hit') {
+    return probeCache.fileInfo
+  }
+  if (probeCache.type === 'negative') {
+    return null
+  }
+  try {
+    const zipInfo = await parseWinZipAesZipInfoFromRemote(parseUrl, headers, fileInfo.size, options)
+    return await cacheExternalWinZipAesZipInfo(fileInfo, zipInfo)
+  } catch (e) {
+    await cacheExternalWinZipAesZipNegative(fileInfo, e)
+    return null
+  }
 }
 
 function applyWinZipAesHeadResponse(response, request) {
@@ -289,16 +311,29 @@ async function proxyHandle(ctx, next) {
     }
     let flowEnc = null
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      const cachedZipInfo = deserializeWinZipAesZipInfo(fileInfo && fileInfo.zipInfo)
-      try {
-        flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, request.fileSize, range, cachedZipInfo)
-      } catch (e) {
-        if (request.isExternalZipCandidate && !(fileInfo && fileInfo.externalZip)) {
-          logger.info('@@ordinary zip passthrough:', filePath, e.message)
+      if (request.isExternalZipCandidate && !(fileInfo && fileInfo.externalZip)) {
+        const externalFileInfo = await prepareExternalWinZipAesZipInfo(
+          request,
+          fileInfo || {
+            path: filePath,
+            name: path.basename(filePath),
+            is_dir: false,
+            size: request.fileSize,
+            zipVirtualName: path.basename(filePath),
+          },
+          request.urlAddr,
+          request.headers
+        )
+        if (!externalFileInfo || !externalFileInfo.zipInfo) {
+          logger.info('@@ordinary zip passthrough:', filePath)
           return await httpProxy(request, response)
         }
-        throw e
+        fileInfo = externalFileInfo
+        request.isExternalZip = true
+        request.zipVirtualName = externalFileInfo.zipInfo && externalFileInfo.zipInfo.innerName
       }
+      const cachedZipInfo = deserializeWinZipAesZipInfo(fileInfo && fileInfo.zipInfo)
+      flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, request.fileSize, range, cachedZipInfo)
       if (
         fileInfo &&
         request.zipInfo &&
@@ -370,14 +405,29 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     const remoteFileSize = result.data.size
     let zipInfo = null
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      try {
-        zipInfo = await parseWinZipAesZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize, { stripAuth: true })
-      } catch (e) {
-        if (ctx.req.isExternalZipCandidate) {
+      if (ctx.req.isExternalZip && ctx.req.cachedExternalZipInfo) {
+        zipInfo = deserializeWinZipAesZipInfo(ctx.req.cachedExternalZipInfo)
+      } else if (ctx.req.isExternalZipCandidate) {
+        const cachedOrParsed = await prepareExternalWinZipAesZipInfo(
+          ctx.req,
+          {
+            path,
+            name: path.split('/').pop(),
+            is_dir: false,
+            size: remoteFileSize,
+            zipVirtualName: path.split('/').pop(),
+          },
+          result.data.raw_url,
+          ctx.req.headers,
+          { stripAuth: true }
+        )
+        if (!cachedOrParsed || !cachedOrParsed.zipInfo) {
           ctx.body = result
           return
         }
-        throw e
+        zipInfo = deserializeWinZipAesZipInfo(cachedOrParsed.zipInfo)
+      } else {
+        zipInfo = await parseWinZipAesZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize, { stripAuth: true })
       }
       result.data.size = zipInfo.plainSize
     }

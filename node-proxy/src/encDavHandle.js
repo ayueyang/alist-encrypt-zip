@@ -11,6 +11,7 @@ import WinZipAesZip, {
   parseWinZipAesZipInfoFromRemote,
   serializeWinZipAesZipInfo,
 } from './utils/winZipAesZip'
+import { enqueueExternalWinZipAesZipProbe } from './utils/winZipAesZipCache'
 // import { escape } from 'querystring'
 
 async function sleep(time) {
@@ -82,6 +83,16 @@ async function prepareWinZipAesWebdavFileInfo(fileDetail, request, passwdInfo) {
   if (!fileDetail || fileDetail.is_dir || fileDetail.zipInfo) return fileDetail
   if (!String(fileDetail.name || '').toLowerCase().endsWith('.zip')) return fileDetail
   const isManagedZipName = isEncryptedZipName(passwdInfo.password, passwdInfo.encType, fileDetail.name)
+  if (!isManagedZipName) {
+    if (passwdInfo.zipAutoCache) {
+      enqueueExternalWinZipAesZipProbe({
+        fileInfo: fileDetail,
+        urlAddr: request.urlAddr,
+        headers: request.headers,
+      })
+    }
+    return fileDetail
+  }
   const cachedFileInfo = await getFileInfo(fileDetail.path)
   if (
     cachedFileInfo &&

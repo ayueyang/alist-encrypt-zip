@@ -36,6 +36,7 @@ const alistServerTemp = {
       encType: 'aesctr', // 算法类型，可选mix，rc4，winzip-aes-ctr，默认aesctr
       enable: true, // enable encrypt
       encName: false, // encrypt file name
+      zipAutoCache: false, // auto probe external WinZip AES ZIP in background
       encSuffix: '', //
       encPath: ['encrypt_folder/*', 'movie_encrypt/*'], // 路径支持正则表达式，常用的就是 尾巴带*，此目录的所文件都加密
     },
@@ -60,6 +61,7 @@ const webdavServerTemp = [
         describe: 'my video',
         enable: false,
         encName: false, // encrypt file name
+        zipAutoCache: false, // auto probe external WinZip AES ZIP in background
         encNameSuffix: '', //
         encPath: ['encrypt_folder/*', '/dav/189cloud/*'], // 子路径
       },

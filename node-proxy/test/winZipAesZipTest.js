@@ -19,6 +19,10 @@ import {
   prepareWinZipAesDownloadRequest,
   ZIP_AES_ENC_TYPE,
 } from '../src/utils/winZipAesZip'
+import {
+  isUsableWinZipAesZipInfoCache,
+  isUsableWinZipAesZipNegativeCache,
+} from '../src/utils/winZipAesZipCache'
 
 const password = 'admin123'
 
@@ -114,6 +118,10 @@ async function main() {
   assert.ok(isRawZipName(password, ZIP_AES_ENC_TYPE, 'abc.zip'))
   assert.ok(isRawZipName(password, ZIP_AES_ENC_TYPE, 'abc.mp4.zip'))
   assert.strictEqual(getAListFileTypeByName('电影.final 4k.mp4'), 2)
+  assert.ok(isUsableWinZipAesZipInfoCache({ size: 123, zipInfo: { encType: ZIP_AES_ENC_TYPE } }, 123))
+  assert.ok(!isUsableWinZipAesZipInfoCache({ size: 124, zipInfo: { encType: ZIP_AES_ENC_TYPE } }, 123))
+  assert.ok(isUsableWinZipAesZipNegativeCache({ size: 123, notPlayable: true }, 123))
+  assert.ok(!isUsableWinZipAesZipNegativeCache({ size: 124, notPlayable: true }, 123))
 
   const plain = Buffer.concat([Buffer.from('ftypisom'), crypto.randomBytes(512 * 1024 + 37), Buffer.from('zip aes tail')])
   const { zipPath } = await createZip(plain)
