@@ -3,11 +3,12 @@
 import MixEnc from './mixEnc'
 import Rc4Md5 from './rc4Md5'
 import AesCTR from './aesCTR'
+import WinZipAesZip, { isWinZipAesEncType } from './winZipAesZip'
 
 const cachePasswdOutward = {}
 
 class FlowEnc {
-  constructor(password, encryptType = 'mix', fileSize = 0) {
+  constructor(password, encryptType = 'mix', fileSize = 0, options = {}) {
     fileSize *= 1
     let encryptFlow = null
     if (encryptType === 'mix') {
@@ -25,7 +26,11 @@ class FlowEnc {
       encryptFlow = new AesCTR(password, fileSize)
       this.passwdOutward = encryptFlow.passwdOutward
     }
-    if (encryptType === null) {
+    if (isWinZipAesEncType(encryptType)) {
+      encryptFlow = new WinZipAesZip(password, fileSize, options)
+      this.passwdOutward = encryptFlow.passwdOutward
+    }
+    if (encryptFlow === null) {
       throw new Error('FlowEnc error')
     }
     cachePasswdOutward[password + encryptType] = this.passwdOutward

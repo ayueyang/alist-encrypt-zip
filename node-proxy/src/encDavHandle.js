@@ -6,6 +6,7 @@ import { logger } from './common/logger'
 import path from 'path'
 import { httpClient } from './utils/httpClient'
 import { XMLParser } from 'fast-xml-parser'
+import WinZipAesZip, { isWinZipAesEncType } from './utils/winZipAesZip'
 // import { escape } from 'querystring'
 
 async function sleep(time) {
@@ -176,7 +177,10 @@ const handle = async (ctx, next) => {
     request.urlAddr = path.dirname(request.urlAddr) + '/' + realName
     // cache file before upload in next(), rclone cmd 'copy' will PROPFIND this file when the file upload success right now
     const contentLength = request.headers['content-length'] || request.headers['x-expected-entity-length'] || 0
-    const fileDetail = { path: url, name: fileName, is_dir: false, size: contentLength }
+    const fileSize = isWinZipAesEncType(passwdInfo.encType)
+      ? WinZipAesZip.packageSize(contentLength * 1, { originalName: fileName })
+      : contentLength
+    const fileDetail = { path: path.dirname(url) + '/' + realName, name: realName, is_dir: false, size: fileSize }
     logger.info('@@@put url', url)
     // 在页面上传文件，rclone会重复上传，所以要进行缓存文件信息，也不能在next() 因为rclone copy命令会出异常
     await cacheFileInfo(fileDetail)

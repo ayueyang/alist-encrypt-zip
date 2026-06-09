@@ -26,6 +26,7 @@
             <!-- <el-radio label="mix" border>MIX</el-radio> -->
             <el-radio label="aesctr" border>AES-CTR</el-radio>
             <el-radio label="rc4" border>RC4</el-radio>
+            <el-radio label="winzip-aes-ctr" border>WinZip-AES-CTR</el-radio>
           </el-radio-group>
           开启
           <el-switch v-model="item.enable" class="ml-2" style="--el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949" />

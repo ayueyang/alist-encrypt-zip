@@ -3,7 +3,8 @@ import https from 'node:https'
 import crypto, { randomUUID } from 'crypto'
 import levelDB from './levelDB'
 import path from 'path'
-import { decodeName } from './commonUtil'
+import { convertShowName, decodeName } from './commonUtil'
+import { applyWinZipAesResponseHeaders, isWinZipAesEncType, serializeWinZipAesZipInfo } from './winZipAesZip'
 // import { pathExec } from './commonUtil'
 const Agent = http.Agent
 const Agents = https.Agent
@@ -36,7 +37,17 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
         if (decryptTransform && passwdInfo.enable) {
           const key = crypto.randomUUID()
           console.log()
-          await levelDB.setExpire(key, { redirectUrl, passwdInfo, fileSize }, 60 * 60 * 72) // 缓存起来，默认3天，足够下载和观看了
+          await levelDB.setExpire(
+            key,
+            {
+              redirectUrl,
+              passwdInfo,
+              fileSize,
+              virtualName: request.zipVirtualName,
+              zipInfo: serializeWinZipAesZipInfo(request.zipInfo),
+            },
+            60 * 60 * 72
+          ) // 缓存起来，默认3天，足够下载和观看了
           // 、Referer
           httpResp.headers.location = `/redirect/${key}?decode=1&lastUrl=${encodeURIComponent(url)}`
         }
@@ -48,10 +59,13 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
       for (const key in httpResp.headers) {
         response.setHeader(key, httpResp.headers[key])
       }
+      applyWinZipAesResponseHeaders(response, request)
       // 下载时解密文件名
       if (method === 'GET' && response.statusCode === 200 && passwdInfo && passwdInfo.enable && passwdInfo.encName) {
         let fileName = decodeURIComponent(path.basename(url))
-        fileName = decodeName(passwdInfo.password, passwdInfo.encType, fileName.replace(path.extname(fileName), ''))
+        fileName = isWinZipAesEncType(passwdInfo.encType)
+          ? convertShowName(passwdInfo.password, passwdInfo.encType, fileName)
+          : decodeName(passwdInfo.password, passwdInfo.encType, fileName.replace(path.extname(fileName), ''))
         if (fileName) {
           let cd = response.getHeader('content-disposition')
           cd = cd ? cd.replace(/filename\*?=[^=;]*;?/g, '') : ''

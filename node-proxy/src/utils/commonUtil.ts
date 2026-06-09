@@ -4,6 +4,7 @@ import path from 'path'
 
 import MixBase64 from './mixBase64'
 import Crcn from './crc6-8'
+import { isWinZipAesEncType } from './winZipAesZip'
 
 const crc6 = new Crcn(6)
 const origPrefix = 'orig_'
@@ -18,18 +19,22 @@ export function convertRealName(password: string, encType: string, pathText: str
   const ext = path.extname(fileName)
   const encName = encodeName(password, encType, decodeURIComponent(fileName))
   console.log('@@decodeURI(fileName)', decodeURIComponent(fileName))
-  return encName + ext
+  return encName + ext + (isWinZipAesEncType(encType) ? '.zip' : '')
 }
 
 // if file name has encrypt, return show name
 export function convertShowName(password: string, encType: string, pathText: string) {
-  const fileName = path.basename(decodeURIComponent(pathText))
+  const rawFileName = path.basename(decodeURIComponent(pathText))
+  let fileName = rawFileName
+  if (isWinZipAesEncType(encType) && fileName.toLowerCase().endsWith('.zip')) {
+    fileName = fileName.slice(0, -4)
+  }
   const ext = path.extname(fileName)
   const encName = fileName.replace(ext, '')
   // encName don't need decodeURI
   let showName = decodeName(password, encType, encName)
   if (showName === null) {
-    showName = origPrefix + fileName
+    showName = origPrefix + rawFileName
   }
   return showName
 }
