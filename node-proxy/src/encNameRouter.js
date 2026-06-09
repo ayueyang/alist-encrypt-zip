@@ -2,13 +2,22 @@
 
 import Router from 'koa-router'
 import bodyparser from 'koa-bodyparser'
-import { encodeName, pathFindPasswd, convertShowName, convertRealName } from './utils/commonUtil'
+import {
+  encodeName,
+  pathFindPasswd,
+  convertShowName,
+  convertRealName,
+  getAListFileTypeByName,
+  getOrigName,
+  isEncryptedZipName,
+  isOrigName,
+} from './utils/commonUtil'
 import path from 'path'
 import { httpClient, httpProxy } from './utils/httpClient'
 import FlowEnc from './utils/flowEnc'
 import { logger } from './common/logger'
-import { getFileInfo } from './dao/fileDao'
-import WinZipAesZip, { isWinZipAesEncType } from './utils/winZipAesZip'
+import { cacheFileInfo, getFileInfo } from './dao/fileDao'
+import WinZipAesZip, { isWinZipAesEncType, parseWinZipAesZipInfoFromRemote, serializeWinZipAesZipInfo } from './utils/winZipAesZip'
 
 // bodyparser解析body
 const bodyparserMw = bodyparser({ enableTypes: ['json', 'form', 'text'] })
@@ -24,6 +33,101 @@ function getEncryptedFileName(passwdInfo, fileName) {
   const ext = passwdInfo.encSuffix || path.extname(baseName)
   const encName = encodeName(passwdInfo.password, passwdInfo.encType, baseName)
   return encName + ext
+}
+
+function getZipPreviewName(fileInfo) {
+  return fileInfo.showName || fileInfo.name
+}
+
+async function getCachedFileInfoByPath(filePath) {
+  return (await getFileInfo(encodeURIComponent(filePath))) || (await getFileInfo(filePath))
+}
+
+function isRawZipName(passwdInfo, fileName) {
+  return (
+    isWinZipAesEncType(passwdInfo.encType) &&
+    String(fileName || '').toLowerCase().endsWith('.zip') &&
+    !isEncryptedZipName(passwdInfo.password, passwdInfo.encType, fileName)
+  )
+}
+
+function getRequestRealName(passwdInfo, fileName, fileInfo) {
+  if (fileInfo && fileInfo.externalZip) {
+    return fileInfo.name || fileName
+  }
+  if (isRawZipName(passwdInfo, fileName)) {
+    return fileName
+  }
+  return isOrigName(fileName) ? getOrigName(fileName) : convertRealName(passwdInfo.password, passwdInfo.encType, fileName)
+}
+
+function getShowName(passwdInfo, rawName, fileInfo) {
+  if (fileInfo && fileInfo.externalZip) {
+    return rawName
+  }
+  if (isRawZipName(passwdInfo, rawName)) {
+    return rawName
+  }
+  return convertShowName(passwdInfo.password, passwdInfo.encType, rawName)
+}
+
+function getExternalZipRenameTarget(fileInfo, name) {
+  if (!fileInfo || !fileInfo.externalZip) return name
+  if (path.extname(name).toLowerCase() !== '.zip') return name
+  const zipInfo = fileInfo.zipInfo || {}
+  const innerExt = path.extname(zipInfo.innerName || '')
+  return innerExt ? path.basename(name, '.zip') + innerExt : name
+}
+
+function joinUrlPath(dir, name) {
+  return `${String(dir || '').replace(/\/$/, '')}/${name}`
+}
+
+async function prepareWinZipAesListFileInfo(fileInfo, request, passwdInfo) {
+  if (!isWinZipAesEncType(passwdInfo.encType) || fileInfo.is_dir || !String(fileInfo.name || '').toLowerCase().endsWith('.zip')) {
+    return fileInfo
+  }
+  const isManaged = isEncryptedZipName(passwdInfo.password, passwdInfo.encType, fileInfo.name)
+  if (isManaged) {
+    fileInfo.name = convertShowName(passwdInfo.password, passwdInfo.encType, fileInfo.name)
+    fileInfo.type = getAListFileTypeByName(fileInfo.name)
+    return fileInfo
+  }
+  try {
+    const cachedFileInfo = await getFileInfo(fileInfo.path)
+    let zipInfo = cachedFileInfo && cachedFileInfo.zipInfo
+    let plainSize = cachedFileInfo && cachedFileInfo.plainSize
+    if (!zipInfo || !cachedFileInfo || Number(cachedFileInfo.size) !== Number(fileInfo.size)) {
+      const oldUrlAddr = request.urlAddr
+      let parsedZipInfo
+      try {
+        request.urlAddr = request.serverAddr + fileInfo.path
+        parsedZipInfo = await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, fileInfo.size)
+      } finally {
+        request.urlAddr = oldUrlAddr
+      }
+      zipInfo = serializeWinZipAesZipInfo(parsedZipInfo)
+      plainSize = parsedZipInfo.plainSize
+      await cacheFileInfo({
+        ...fileInfo,
+        size: fileInfo.size,
+        plainSize,
+        zipInfo,
+        externalZip: true,
+        zipVirtualName: fileInfo.name,
+      })
+    }
+    fileInfo.plainSize = plainSize
+    fileInfo.zipInfo = zipInfo
+    fileInfo.externalZip = true
+    fileInfo.type = getAListFileTypeByName(zipInfo.innerName)
+    if (plainSize !== undefined) {
+      fileInfo.size = plainSize
+    }
+  } catch (e) {
+    // Keep ordinary ZIP files untouched.
+  }
+  return fileInfo
 }
 
 // 拦截全部
@@ -46,7 +150,10 @@ encNameRouter.all('/api/fs/list', async (ctx, next) => {
       //  Check path if the file name needs to be encrypted
       const { passwdInfo } = pathFindPasswd(passwdList, decodeURI(fileInfo.path))
       if (passwdInfo && passwdInfo.encName) {
-        fileInfo.name = convertShowName(passwdInfo.password, passwdInfo.encType, fileInfo.name)
+        await prepareWinZipAesListFileInfo(fileInfo, ctx.req, passwdInfo)
+        if (!isWinZipAesEncType(passwdInfo.encType)) {
+          fileInfo.name = convertShowName(passwdInfo.password, passwdInfo.encType, fileInfo.name)
+        }
       }
     }
 
@@ -65,7 +172,7 @@ encNameRouter.all('/api/fs/list', async (ctx, next) => {
       if (fileInfo.is_dir) {
         return
       }
-      const coverName = coverNameMap[fileInfo.name.split('.')[0]]
+      const coverName = coverNameMap[getZipPreviewName(fileInfo).split('.')[0]]
       if (fileInfo.type === 2 && coverName) {
         omitNames.push(coverName)
         fileInfo.thumb = `/d${path}/${coverName}`
@@ -141,6 +248,11 @@ const copyOrMoveFile = async (ctx, next) => {
         fileNames.push(origName)
         break
       }
+      const cachedFileInfo = await getCachedFileInfoByPath(joinUrlPath(srcDir, name))
+      if ((cachedFileInfo && cachedFileInfo.externalZip) || isRawZipName(passwdInfo, name)) {
+        fileNames.push(name)
+        continue
+      }
       const newFileName = getEncryptedFileName(passwdInfo, name)
       fileNames.push(newFileName)
     }
@@ -163,19 +275,27 @@ encNameRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
   const { path: filePath } = ctx.request.body
   const { webdavConfig } = ctx.req
   const { passwdInfo } = pathFindPasswd(webdavConfig.passwdList, filePath)
+  let fileInfo = null
   if (passwdInfo && passwdInfo.encName) {
     ctx.req.encVirtualPath = filePath
     // reset content-length length
     delete ctx.req.headers['content-length']
     // check fileName is not enc
     const fileName = path.basename(filePath)
-    const fileInfo = await getFileInfo(encodeURIComponent(filePath))
+    fileInfo = await getCachedFileInfoByPath(filePath)
     if (fileInfo && fileInfo.is_dir) {
       await next()
       return
     }
+    if (isWinZipAesEncType(passwdInfo.encType)) {
+      ctx.req.isExternalZip = !!(fileInfo && fileInfo.externalZip)
+      ctx.req.isExternalZipCandidate = !ctx.req.isExternalZip && isRawZipName(passwdInfo, fileName)
+      if (ctx.req.isExternalZip && fileInfo.zipInfo) {
+        ctx.req.zipVirtualName = fileInfo.zipInfo.innerName
+      }
+    }
     //  Check if it is a directory
-    const realName = convertRealName(passwdInfo.password, passwdInfo.encType, fileName)
+    const realName = getRequestRealName(passwdInfo, fileName, fileInfo)
     const fpath = path.dirname(filePath) + '/' + realName
     console.log('@@@getFilePath', fpath)
     ctx.request.body.path = fpath
@@ -183,8 +303,13 @@ encNameRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
   await next()
   if (passwdInfo && passwdInfo.encName) {
     // return showName
-    const showName = convertShowName(passwdInfo.password, passwdInfo.encType, ctx.body.data.name)
+    const showName = getShowName(passwdInfo, ctx.body.data.name, fileInfo)
     ctx.body.data.name = showName
+    if (fileInfo && fileInfo.externalZip && fileInfo.zipInfo) {
+      ctx.body.data.type = getAListFileTypeByName(fileInfo.zipInfo.innerName)
+    } else if (!ctx.req.isExternalZipCandidate) {
+      ctx.body.data.type = getAListFileTypeByName(showName)
+    }
   }
 })
 
@@ -197,20 +322,22 @@ encNameRouter.all('/api/fs/rename', bodyparserMw, async (ctx, next) => {
   // reset content-length length
   delete ctx.req.headers['content-length']
 
-  let fileInfo = await getFileInfo(encodeURIComponent(filePath))
+  let fileInfo = await getCachedFileInfoByPath(filePath)
   if (fileInfo == null && passwdInfo && passwdInfo.encName) {
     // mabay a file
     const realName = convertRealName(passwdInfo.password, passwdInfo.encType, filePath)
     const realFilePath = path.dirname(filePath) + '/' + realName
-    fileInfo = await getFileInfo(encodeURIComponent(realFilePath))
+    fileInfo = await getCachedFileInfoByPath(realFilePath)
   }
   if (passwdInfo && passwdInfo.encName && fileInfo && !fileInfo.is_dir) {
     // reset content-length length
     // you can custom Suffix
-    const realName = convertRealName(passwdInfo.password, passwdInfo.encType, filePath)
+    const realName = fileInfo.externalZip
+      ? fileInfo.name
+      : convertRealName(passwdInfo.password, passwdInfo.encType, filePath)
     const fpath = path.dirname(filePath) + '/' + realName
     reqBody.path = fpath
-    reqBody.name = getEncryptedFileName(passwdInfo, name)
+    reqBody.name = getEncryptedFileName(passwdInfo, getExternalZipRenameTarget(fileInfo, name))
   }
   ctx.req.reqBody = reqBody
   console.log('@@@rename', reqBody)
@@ -239,7 +366,8 @@ const handleDownload = async (ctx, next) => {
     delete ctx.req.headers['content-length']
     // Check whether the file name refers to an encrypted file or a directory
     const fileName = path.basename(filePath)
-    const realName = convertRealName(passwdInfo.password, passwdInfo.encType, fileName)
+    const fileInfo = await getCachedFileInfoByPath(filePath)
+    const realName = getRequestRealName(passwdInfo, fileName, fileInfo)
     // Replace the real-name before downloading
     ctx.req.url = ctx.req.url.replace(regexPath, `/${realName}$2`)
     ctx.req.urlAddr = ctx.req.urlAddr.replace(regexPath, `/${realName}$2`)

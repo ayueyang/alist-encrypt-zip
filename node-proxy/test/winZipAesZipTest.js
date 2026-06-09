@@ -7,6 +7,13 @@ import path from 'path'
 import { pipeline } from 'stream/promises'
 import WinZipAesZip from '../src/utils/winZipAesZip'
 import {
+  convertRealName,
+  convertShowName,
+  getAListFileTypeByName,
+  isEncryptedZipName,
+  isRawZipName,
+} from '../src/utils/commonUtil'
+import {
   isWinZipAesEncType,
   parseWinZipAesZipInfoFromFile,
   prepareWinZipAesDownloadRequest,
@@ -98,6 +105,15 @@ async function assertRanges(zipPath, plain) {
 
 async function main() {
   assert.ok(isWinZipAesEncType(ZIP_AES_ENC_TYPE))
+  const encryptedName = convertRealName(password, ZIP_AES_ENC_TYPE, '电影.final 4k.mp4')
+  assert.ok(encryptedName.endsWith('.zip'))
+  assert.ok(!encryptedName.endsWith('.mp4.zip'))
+  assert.strictEqual(convertShowName(password, ZIP_AES_ENC_TYPE, encryptedName), '电影.final 4k.mp4')
+  assert.ok(isEncryptedZipName(password, ZIP_AES_ENC_TYPE, encryptedName))
+  assert.ok(isRawZipName(password, ZIP_AES_ENC_TYPE, 'abc.zip'))
+  assert.ok(isRawZipName(password, ZIP_AES_ENC_TYPE, 'abc.mp4.zip'))
+  assert.strictEqual(getAListFileTypeByName('电影.final 4k.mp4'), 2)
+
   const plain = Buffer.concat([Buffer.from('ftypisom'), crypto.randomBytes(512 * 1024 + 37), Buffer.from('zip aes tail')])
   const { zipPath } = await createZip(plain)
   const zipInfo = await parseWinZipAesZipInfoFromFile(zipPath)

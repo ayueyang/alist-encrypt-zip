@@ -25,7 +25,7 @@ import WinZipAesZip, {
 } from '@/utils/winZipAesZip'
 import levelDB from '@/utils/levelDB'
 import { webdavServer, alistServer, port, version } from '@/config'
-import { convertRealName, pathExec, pathFindPasswd } from '@/utils/commonUtil'
+import { convertRealName, getAListFileTypeByName, isRawZipName, pathExec, pathFindPasswd } from '@/utils/commonUtil'
 import globalHandle from '@/middleware/globalHandle'
 import encApiRouter from '@/router'
 import encNameRouter from '@/encNameRouter'
@@ -48,15 +48,6 @@ function getRangeStart(range) {
   return range ? Number(String(range).replace('bytes=', '').split('-')[0] || 0) : 0
 }
 
-function getAListFileTypeByName(fileName = '') {
-  const ext = path.extname(String(fileName).split('?')[0]).toLowerCase()
-  if (['.mp4', '.m4v', '.webm', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.ts', '.mpg', '.mpeg'].includes(ext)) return 2
-  if (['.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg'].includes(ext)) return 3
-  if (['.txt', '.md', '.json', '.js', '.ts', '.css', '.html', '.xml', '.log'].includes(ext)) return 4
-  if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'].includes(ext)) return 5
-  return 0
-}
-
 function setWinZipAesUploadSize(request, passwdInfo, plainSize, originalName) {
   if (!isWinZipAesEncType(passwdInfo.encType)) return
   const packageSize = WinZipAesZip.packageSize(plainSize, {
@@ -72,7 +63,11 @@ async function prepareWinZipAesDecrypt(request, passwdInfo, zipSize, rangeHeader
   const zipInfo =
     validCachedZipInfo ||
     (await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, zipSize))
-  request.zipVirtualName = request.zipVirtualName || path.basename(decodeURIComponent(request.url.split('?')[0] || zipInfo.innerName))
+  request.zipVirtualName =
+    request.zipVirtualName ||
+    (request.isExternalZip || request.isExternalZipCandidate
+      ? zipInfo.innerName
+      : path.basename(decodeURIComponent(request.url.split('?')[0] || zipInfo.innerName)))
   prepareWinZipAesDownloadRequest(request, zipInfo, rangeHeader)
   const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, zipInfo.plainSize, { zipInfo })
   await flowEnc.setPosition(request.zipCipherStart || 0)
@@ -212,7 +207,7 @@ async function proxyHandle(ctx, next) {
     if (request.fileSize === 0) {
       return await httpProxy(request, response)
     }
-    const originalName = path.basename(decodeURIComponent(request.url.split('?')[0] || ''))
+    const originalName = request.originalName || path.basename(decodeURIComponent(request.url.split('?')[0] || ''))
     setWinZipAesUploadSize(request, passwdInfo, request.fileSize, originalName)
     const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize, { originalName })
     return await httpProxy(request, response, flowEnc.encryptTransform())
@@ -233,16 +228,21 @@ async function proxyHandle(ctx, next) {
     }
     // 尝试获取文件信息，如果未找到相应的文件信息，则对文件名进行加密处理后重新尝试获取文件信息
     let fileInfo = await getFileInfo(filePath);
+    const requestedFileName = decodeURIComponent(path.basename(filePath))
 
     if (fileInfo === null) {
-      const rawFileName = decodeURIComponent(path.basename(filePath));
-      const encodedRawFileName = encodeURIComponent(rawFileName);
-      const newFileName = convertRealName(passwdInfo.password, passwdInfo.encType, rawFileName);
-    
-      filePath = filePath.replace(encodedRawFileName, newFileName);
-      request.urlAddr = request.urlAddr.replace(encodedRawFileName, newFileName);
-    
-      fileInfo = await getFileInfo(filePath);
+      if (!isWinZipAesEncType(passwdInfo.encType) || !requestedFileName.toLowerCase().endsWith('.zip')) {
+        const encodedRawFileName = encodeURIComponent(requestedFileName);
+        const newFileName = convertRealName(passwdInfo.password, passwdInfo.encType, requestedFileName);
+
+        filePath = filePath.replace(encodedRawFileName, newFileName);
+        request.urlAddr = request.urlAddr.replace(encodedRawFileName, newFileName);
+
+        fileInfo = await getFileInfo(filePath);
+      }
+    }
+    if (isRawZipName(passwdInfo.password, passwdInfo.encType, requestedFileName)) {
+      request.isExternalZipCandidate = true
     }
     logger.info('@@getFileInfo:', filePath, fileInfo, request.urlAddr)
     if (
@@ -262,6 +262,10 @@ async function proxyHandle(ctx, next) {
     }
     if (fileInfo) {
       request.fileSize = fileInfo.size * 1
+      if (fileInfo.externalZip) {
+        request.isExternalZip = true
+        request.zipVirtualName = fileInfo.zipInfo && fileInfo.zipInfo.innerName
+      }
     } else if (request.headers.authorization) {
       // 这里要判断是否webdav进行请求, 这里默认就是webdav请求了
       const authorization = request.headers.authorization
@@ -286,7 +290,15 @@ async function proxyHandle(ctx, next) {
     let flowEnc = null
     if (isWinZipAesEncType(passwdInfo.encType)) {
       const cachedZipInfo = deserializeWinZipAesZipInfo(fileInfo && fileInfo.zipInfo)
-      flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, request.fileSize, range, cachedZipInfo)
+      try {
+        flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, request.fileSize, range, cachedZipInfo)
+      } catch (e) {
+        if (request.isExternalZipCandidate && !(fileInfo && fileInfo.externalZip)) {
+          logger.info('@@ordinary zip passthrough:', filePath, e.message)
+          return await httpProxy(request, response)
+        }
+        throw e
+      }
       if (
         fileInfo &&
         request.zipInfo &&
@@ -296,6 +308,8 @@ async function proxyHandle(ctx, next) {
           ...fileInfo,
           plainSize: request.zipInfo.plainSize,
           zipInfo: serializeWinZipAesZipInfo(request.zipInfo),
+          externalZip: fileInfo.externalZip || request.isExternalZipCandidate,
+          zipVirtualName: fileInfo.zipVirtualName || (request.isExternalZipCandidate ? path.basename(filePath) : undefined),
         })
       }
       if (request.method.toLocaleUpperCase() === 'HEAD') {
@@ -356,18 +370,27 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     const remoteFileSize = result.data.size
     let zipInfo = null
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      zipInfo = await parseWinZipAesZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize, { stripAuth: true })
+      try {
+        zipInfo = await parseWinZipAesZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize, { stripAuth: true })
+      } catch (e) {
+        if (ctx.req.isExternalZipCandidate) {
+          ctx.body = result
+          return
+        }
+        throw e
+      }
       result.data.size = zipInfo.plainSize
     }
     const key = crypto.randomUUID()
     const virtualName = decodeURIComponent((ctx.req.encVirtualPath || path).split('/').pop() || '')
+    const previewName = (ctx.req.isExternalZip || ctx.req.isExternalZipCandidate) && zipInfo ? zipInfo.innerName : virtualName
     await levelDB.setExpire(
       key,
       {
         redirectUrl: result.data.raw_url,
         passwdInfo,
         fileSize: remoteFileSize,
-        virtualName,
+        virtualName: previewName,
         zipInfo: serializeWinZipAesZipInfo(zipInfo),
       },
       60 * 60 * 72
@@ -375,8 +398,8 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     result.data.raw_url = `${
       headers.origin || (headers['x-forwarded-proto'] || ctx.protocol) + '://' + ctx.req.selfHost
     }/redirect/${key}?decode=1&lastUrl=${encodeURIComponent(path)}`
-    if (virtualName) {
-      result.data.type = getAListFileTypeByName(virtualName)
+    if (previewName) {
+      result.data.type = getAListFileTypeByName(previewName)
     }
     if (isWinZipAesEncType(passwdInfo.encType) || result.data.provider === 'AliyundriveOpen') result.data.provider = 'Local'
   }

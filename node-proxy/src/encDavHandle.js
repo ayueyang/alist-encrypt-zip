@@ -1,6 +1,6 @@
 'use strict'
 
-import { pathFindPasswd, convertRealName, convertShowName } from './utils/commonUtil'
+import { pathFindPasswd, convertRealName, convertShowName, getOrigName, isEncryptedZipName, isOrigName, isRawZipName } from './utils/commonUtil'
 import { cacheFileInfo, getFileInfo } from './dao/fileDao'
 import { logger } from './common/logger'
 import path from 'path'
@@ -38,7 +38,11 @@ function getFileNameForShow(fileInfo, passwdInfo) {
   // logger.debug('@@fileInfo_show', JSON.stringify(fileInfo))
   // is not dir
   if (getcontentlength !== undefined && getcontentlength > -1) {
-    const showName = convertShowName(passwdInfo.password, passwdInfo.encType, href)
+    const showName = isWinZipAesEncType(passwdInfo.encType)
+      ? isEncryptedZipName(passwdInfo.password, passwdInfo.encType, fileName)
+        ? convertShowName(passwdInfo.password, passwdInfo.encType, href)
+        : fileName
+      : convertShowName(passwdInfo.password, passwdInfo.encType, href)
     return { fileName, showName }
   }
   // cache this folder info
@@ -74,29 +78,40 @@ function replaceOnce(text, from, to) {
   return text.slice(0, index) + to + text.slice(index + from.length)
 }
 
-async function prepareWinZipAesWebdavFileInfo(fileDetail, request) {
+async function prepareWinZipAesWebdavFileInfo(fileDetail, request, passwdInfo) {
   if (!fileDetail || fileDetail.is_dir || fileDetail.zipInfo) return fileDetail
+  if (!String(fileDetail.name || '').toLowerCase().endsWith('.zip')) return fileDetail
+  const isManagedZipName = isEncryptedZipName(passwdInfo.password, passwdInfo.encType, fileDetail.name)
   const cachedFileInfo = await getFileInfo(fileDetail.path)
   if (
     cachedFileInfo &&
     cachedFileInfo.zipInfo &&
     isWinZipAesEncType(cachedFileInfo.zipInfo.encType) &&
-    Number(cachedFileInfo.size) === Number(fileDetail.size)
+    Number(cachedFileInfo.size) === Number(fileDetail.size) &&
+    !!cachedFileInfo.externalZip === !isManagedZipName
   ) {
     return {
       ...fileDetail,
       plainSize: cachedFileInfo.plainSize,
       zipInfo: cachedFileInfo.zipInfo,
+      externalZip: cachedFileInfo.externalZip,
+      zipVirtualName: cachedFileInfo.zipVirtualName,
     }
   }
-  const zipInfo = await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, fileDetail.size)
-  const nextFileInfo = {
-    ...fileDetail,
-    plainSize: zipInfo.plainSize,
-    zipInfo: serializeWinZipAesZipInfo(zipInfo),
+  try {
+    const zipInfo = await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, fileDetail.size)
+    const nextFileInfo = {
+      ...fileDetail,
+      plainSize: zipInfo.plainSize,
+      zipInfo: serializeWinZipAesZipInfo(zipInfo),
+      externalZip: !isManagedZipName,
+      zipVirtualName: isManagedZipName ? undefined : fileDetail.name,
+    }
+    await cacheFileInfo(nextFileInfo)
+    return nextFileInfo
+  } catch (e) {
+    return fileDetail
   }
-  await cacheFileInfo(nextFileInfo)
-  return nextFileInfo
 }
 
 function rewriteWebdavContentLength(respBody, fileInfo, plainSize) {
@@ -113,6 +128,21 @@ function isWebdavFileRequest(url, fileName) {
   return !url.endsWith('/') && !!path.extname(decodeURIComponent(fileName || ''))
 }
 
+function getRequestRealName(passwdInfo, url, fileInfo) {
+  const fileName = path.basename(url)
+  if (fileInfo && fileInfo.externalZip) return fileInfo.name || fileName
+  if (isRawZipName(passwdInfo.password, passwdInfo.encType, fileName)) return fileName
+  if (isOrigName(fileName)) return getOrigName(fileName)
+  return convertRealName(passwdInfo.password, passwdInfo.encType, url)
+}
+
+function getExternalZipRenameTarget(fileInfo, destinationName) {
+  if (!fileInfo || !fileInfo.externalZip) return destinationName
+  if (path.extname(destinationName).toLowerCase() !== '.zip') return destinationName
+  const innerExt = path.extname((fileInfo.zipInfo && fileInfo.zipInfo.innerName) || '')
+  return innerExt ? path.basename(destinationName, '.zip') + innerExt : destinationName
+}
+
 // 拦截全部
 const handle = async (ctx, next) => {
   const request = ctx.req
@@ -125,13 +155,18 @@ const handle = async (ctx, next) => {
       // check dir, convert url
       const reqFileName = path.basename(url)
       // cache source file info, realName has execute encodeUrl()，this '(' '+' can't encodeUrl.
-      const realName = convertRealName(passwdInfo.password, passwdInfo.encType, url)
+      const isManagedZipName = isEncryptedZipName(passwdInfo.password, passwdInfo.encType, reqFileName)
+      const realName =
+        isManagedZipName || !isRawZipName(passwdInfo.password, passwdInfo.encType, reqFileName)
+          ? convertRealName(passwdInfo.password, passwdInfo.encType, url)
+          : reqFileName
       // when the name contain the + , ! ,
       const sourceUrl = path.dirname(url) + '/' + realName
       const sourceFileInfo = await getFileInfo(sourceUrl)
       logger.debug('@@@sourceFileInfo', sourceFileInfo, reqFileName, realName, url, sourceUrl)
       // it is file, convert file name
       if ((sourceFileInfo && !sourceFileInfo.is_dir) || isWebdavFileRequest(url, reqFileName)) {
+        request.isManagedZipName = isManagedZipName
         request.url = path.dirname(request.url) + '/' + realName
         request.urlAddr = path.dirname(request.urlAddr) + '/' + realName
       }
@@ -150,7 +185,7 @@ const handle = async (ctx, next) => {
           if (isWinZipAesEncType(passwdInfo.encType) && fileDetail && !fileDetail.is_dir) {
             const oldUrlAddr = request.urlAddr
             request.urlAddr = request.serverAddr + fileDetail.path
-            fileDetail = await prepareWinZipAesWebdavFileInfo(fileDetail, request)
+            fileDetail = await prepareWinZipAesWebdavFileInfo(fileDetail, request, passwdInfo)
             request.urlAddr = oldUrlAddr
             respBody = rewriteWebdavContentLength(respBody, fileInfo, fileDetail.plainSize)
           }
@@ -170,7 +205,7 @@ const handle = async (ctx, next) => {
         const fileInfo = respJson
         let fileDetail = cacheWebdavFileInfo(fileInfo)
         if (isWinZipAesEncType(passwdInfo.encType) && fileDetail && !fileDetail.is_dir) {
-          fileDetail = await prepareWinZipAesWebdavFileInfo(fileDetail, request)
+          fileDetail = await prepareWinZipAesWebdavFileInfo(fileDetail, request, passwdInfo)
           respBody = rewriteWebdavContentLength(respBody, fileInfo, fileDetail.plainSize)
         }
         const { fileName, showName } = getFileNameForShow(fileInfo, passwdInfo)
@@ -200,8 +235,11 @@ const handle = async (ctx, next) => {
   // copy or move file
   if ('COPY,MOVE'.includes(request.method.toLocaleUpperCase()) && passwdInfo && passwdInfo.encName) {
     const url = request.url
-    const realName = convertRealName(passwdInfo.password, passwdInfo.encType, url)
-    request.headers.destination = path.dirname(request.headers.destination) + '/' + encodeURI(realName)
+    const fileInfo = await getFileInfo(url)
+    const realName = getRequestRealName(passwdInfo, url, fileInfo)
+    const destinationName = path.basename(decodeURIComponent(request.headers.destination || ''))
+    const destinationRealName = convertRealName(passwdInfo.password, passwdInfo.encType, getExternalZipRenameTarget(fileInfo, destinationName))
+    request.headers.destination = path.dirname(request.headers.destination) + '/' + encodeURI(destinationRealName)
     request.url = path.dirname(request.url) + '/' + encodeURI(realName)
     request.urlAddr = path.dirname(request.urlAddr) + '/' + encodeURI(realName)
   }
@@ -211,7 +249,8 @@ const handle = async (ctx, next) => {
     const url = request.url
     // check dir, convert url
     const fileName = path.basename(url)
-    const realName = convertRealName(passwdInfo.password, passwdInfo.encType, url)
+    const cachedFileInfo = await getFileInfo(url)
+    const realName = getRequestRealName(passwdInfo, url, cachedFileInfo)
     // maybe from aliyundrive, check this req url while get file list from enc folder
     if (url.endsWith('/') && 'GET,DELETE'.includes(request.method.toLocaleUpperCase())) {
       let respBody = await httpClient(ctx.req, ctx.res)
@@ -238,7 +277,15 @@ const handle = async (ctx, next) => {
 
     // console.log('@@convert file name', fileName, realName)
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      request.zipVirtualName = decodeURIComponent(fileName)
+      request.isExternalZip = cachedFileInfo && cachedFileInfo.externalZip
+      request.isExternalZipCandidate = !request.isExternalZip && isRawZipName(passwdInfo.password, passwdInfo.encType, fileName)
+      request.originalName = decodeURIComponent(fileName)
+      request.zipVirtualName =
+        request.isExternalZip && cachedFileInfo.zipInfo
+          ? cachedFileInfo.zipInfo.innerName
+          : request.isExternalZipCandidate
+            ? undefined
+            : decodeURIComponent(fileName)
     }
     request.url = path.dirname(request.url) + '/' + realName
     request.urlAddr = path.dirname(request.urlAddr) + '/' + realName
