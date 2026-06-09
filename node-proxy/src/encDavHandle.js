@@ -6,7 +6,11 @@ import { logger } from './common/logger'
 import path from 'path'
 import { httpClient } from './utils/httpClient'
 import { XMLParser } from 'fast-xml-parser'
-import WinZipAesZip, { isWinZipAesEncType } from './utils/winZipAesZip'
+import WinZipAesZip, {
+  isWinZipAesEncType,
+  parseWinZipAesZipInfoFromRemote,
+  serializeWinZipAesZipInfo,
+} from './utils/winZipAesZip'
 // import { escape } from 'querystring'
 
 async function sleep(time) {
@@ -20,15 +24,17 @@ async function sleep(time) {
 // bodyparser解析body
 const parser = new XMLParser({ removeNSPrefix: true })
 
+function getProp(fileInfo) {
+  if (fileInfo.propstat instanceof Array) return fileInfo.propstat[0].prop
+  return fileInfo.propstat.prop
+}
+
 function getFileNameForShow(fileInfo, passwdInfo) {
   let getcontentlength = -1
   const href = fileInfo.href
   const fileName = path.basename(href)
-  if (fileInfo.propstat instanceof Array) {
-    getcontentlength = fileInfo.propstat[0].prop.getcontentlength
-  } else if (fileInfo.propstat.prop) {
-    getcontentlength = fileInfo.propstat.prop.getcontentlength
-  }
+  const prop = getProp(fileInfo)
+  if (prop) getcontentlength = prop.getcontentlength
   // logger.debug('@@fileInfo_show', JSON.stringify(fileInfo))
   // is not dir
   if (getcontentlength !== undefined && getcontentlength > -1) {
@@ -43,11 +49,8 @@ function cacheWebdavFileInfo(fileInfo) {
   let getcontentlength = -1
   const href = fileInfo.href
   const fileName = path.basename(href)
-  if (fileInfo.propstat instanceof Array) {
-    getcontentlength = fileInfo.propstat[0].prop.getcontentlength
-  } else if (fileInfo.propstat.prop) {
-    getcontentlength = fileInfo.propstat.prop.getcontentlength
-  }
+  const prop = getProp(fileInfo)
+  if (prop) getcontentlength = prop.getcontentlength
   // logger.debug('@@@cacheWebdavFileInfo', href, fileName)
   // it is a file
   if (getcontentlength !== undefined && getcontentlength > -1) {
@@ -59,6 +62,51 @@ function cacheWebdavFileInfo(fileInfo) {
   const fileDetail = { path: href, name: fileName, is_dir: true, size: 0 }
   cacheFileInfo(fileDetail)
   return fileDetail
+}
+
+function xmlEscapeText(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&gt;')
+}
+
+function replaceOnce(text, from, to) {
+  const index = text.indexOf(from)
+  if (index < 0) return text
+  return text.slice(0, index) + to + text.slice(index + from.length)
+}
+
+async function prepareWinZipAesWebdavFileInfo(fileDetail, request) {
+  if (!fileDetail || fileDetail.is_dir || fileDetail.zipInfo) return fileDetail
+  const cachedFileInfo = await getFileInfo(fileDetail.path)
+  if (
+    cachedFileInfo &&
+    cachedFileInfo.zipInfo &&
+    isWinZipAesEncType(cachedFileInfo.zipInfo.encType) &&
+    Number(cachedFileInfo.size) === Number(fileDetail.size)
+  ) {
+    return {
+      ...fileDetail,
+      plainSize: cachedFileInfo.plainSize,
+      zipInfo: cachedFileInfo.zipInfo,
+    }
+  }
+  const zipInfo = await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, fileDetail.size)
+  const nextFileInfo = {
+    ...fileDetail,
+    plainSize: zipInfo.plainSize,
+    zipInfo: serializeWinZipAesZipInfo(zipInfo),
+  }
+  await cacheFileInfo(nextFileInfo)
+  return nextFileInfo
+}
+
+function rewriteWebdavContentLength(respBody, fileInfo, plainSize) {
+  const prop = getProp(fileInfo)
+  if (!prop || prop.getcontentlength === undefined || plainSize === undefined) return respBody
+  return replaceOnce(
+    respBody,
+    `<D:getcontentlength>${prop.getcontentlength}</D:getcontentlength>`,
+    `<D:getcontentlength>${plainSize}</D:getcontentlength>`
+  )
 }
 
 // 拦截全部
@@ -92,27 +140,39 @@ const handle = async (ctx, next) => {
       const respJson = respData.multistatus.response
       if (respJson instanceof Array) {
         // console.log('@@respJsonArray', respJson)
-        respJson.forEach((fileInfo) => {
+        for (const fileInfo of respJson) {
           // cache real file info，include forder name
-          cacheWebdavFileInfo(fileInfo)
+          let fileDetail = cacheWebdavFileInfo(fileInfo)
+          if (isWinZipAesEncType(passwdInfo.encType) && fileDetail && !fileDetail.is_dir) {
+            const oldUrlAddr = request.urlAddr
+            request.urlAddr = request.serverAddr + fileDetail.path
+            fileDetail = await prepareWinZipAesWebdavFileInfo(fileDetail, request)
+            request.urlAddr = oldUrlAddr
+            respBody = rewriteWebdavContentLength(respBody, fileInfo, fileDetail.plainSize)
+          }
           if (passwdInfo && passwdInfo.encName) {
             const { fileName, showName } = getFileNameForShow(fileInfo, passwdInfo)
             // logger.debug('@@getFileNameForShow1 list', passwdInfo.password, fileName, decodeURI(fileName), showName)
             if (fileName) {
-              const showXmlName = showName.replace(/&/g, '&amp;').replace(/</g, '&gt;')
+              const showXmlName = xmlEscapeText(showName)
               respBody = respBody.replace(`${fileName}</D:href>`, `${encodeURI(showXmlName)}</D:href>`)
               respBody = respBody.replace(`${decodeURI(fileName)}</D:displayname>`, `${decodeURI(showXmlName)}</D:displayname>`)
             }
           }
-        })
+        }
         // waiting cacheWebdavFileInfo a moment
         await sleep(50)
       } else if (passwdInfo && passwdInfo.encName) {
         const fileInfo = respJson
+        let fileDetail = cacheWebdavFileInfo(fileInfo)
+        if (isWinZipAesEncType(passwdInfo.encType) && fileDetail && !fileDetail.is_dir) {
+          fileDetail = await prepareWinZipAesWebdavFileInfo(fileDetail, request)
+          respBody = rewriteWebdavContentLength(respBody, fileInfo, fileDetail.plainSize)
+        }
         const { fileName, showName } = getFileNameForShow(fileInfo, passwdInfo)
         // logger.debug('@@getFileNameForShow2 file', fileName, showName, url, respJson.propstat)
         if (fileName) {
-          const showXmlName = showName.replace(/&/g, '&amp;').replace(/</g, '&gt;')
+          const showXmlName = xmlEscapeText(showName)
           respBody = respBody.replace(`${fileName}</D:href>`, `${encodeURI(showXmlName)}</D:href>`)
           respBody = respBody.replace(`${decodeURI(fileName)}</D:displayname>`, `${decodeURI(showXmlName)}</D:displayname>`)
         }
@@ -173,8 +233,15 @@ const handle = async (ctx, next) => {
     }
 
     // console.log('@@convert file name', fileName, realName)
+    if (isWinZipAesEncType(passwdInfo.encType)) {
+      request.zipVirtualName = decodeURIComponent(fileName)
+    }
     request.url = path.dirname(request.url) + '/' + realName
     request.urlAddr = path.dirname(request.urlAddr) + '/' + realName
+    if (request.method.toLocaleUpperCase() !== 'PUT') {
+      await next()
+      return
+    }
     // cache file before upload in next(), rclone cmd 'copy' will PROPFIND this file when the file upload success right now
     const contentLength = request.headers['content-length'] || request.headers['x-expected-entity-length'] || 0
     const fileSize = isWinZipAesEncType(passwdInfo.encType)

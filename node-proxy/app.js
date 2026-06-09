@@ -17,6 +17,7 @@ import bodyparser from 'koa-bodyparser'
 import FlowEnc from '@/utils/flowEnc'
 import WinZipAesZip, {
   deserializeWinZipAesZipInfo,
+  getMimeByName,
   isWinZipAesEncType,
   parseWinZipAesZipInfoFromRemote,
   prepareWinZipAesDownloadRequest,
@@ -66,14 +67,30 @@ function setWinZipAesUploadSize(request, passwdInfo, plainSize, originalName) {
 }
 
 async function prepareWinZipAesDecrypt(request, passwdInfo, zipSize, rangeHeader, cachedZipInfo = null) {
+  const validCachedZipInfo =
+    cachedZipInfo && Number(cachedZipInfo.totalSize) === Number(zipSize) ? cachedZipInfo : null
   const zipInfo =
-    cachedZipInfo ||
+    validCachedZipInfo ||
     (await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, zipSize))
   request.zipVirtualName = request.zipVirtualName || path.basename(decodeURIComponent(request.url.split('?')[0] || zipInfo.innerName))
   prepareWinZipAesDownloadRequest(request, zipInfo, rangeHeader)
   const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, zipInfo.plainSize, { zipInfo })
   await flowEnc.setPosition(request.zipCipherStart || 0)
   return flowEnc
+}
+
+function applyWinZipAesHeadResponse(response, request) {
+  const { zipInfo, zipPlainRange } = request
+  if (!zipInfo || !zipPlainRange) return
+  response.statusCode = zipPlainRange.hasRange ? 206 : 200
+  if (zipPlainRange.hasRange) {
+    response.setHeader('content-range', `bytes ${zipPlainRange.start}-${zipPlainRange.end}/${zipInfo.plainSize}`)
+  } else {
+    response.removeHeader('content-range')
+  }
+  response.setHeader('accept-ranges', 'bytes')
+  response.setHeader('content-length', String(Math.max(0, zipPlainRange.end - zipPlainRange.start + 1)))
+  response.setHeader('content-type', getMimeByName(request.zipVirtualName || request.url))
 }
 
 const proxyRouter = new Router()
@@ -228,6 +245,21 @@ async function proxyHandle(ctx, next) {
       fileInfo = await getFileInfo(filePath);
     }
     logger.info('@@getFileInfo:', filePath, fileInfo, request.urlAddr)
+    if (
+      request.isWebdav &&
+      fileInfo &&
+      isWinZipAesEncType(passwdInfo.encType) &&
+      Number(fileInfo.size) < 1024 &&
+      request.headers.authorization
+    ) {
+      const webdavFileInfo = await getWebdavFileInfo(request.urlAddr, request.headers.authorization)
+      logger.info('@@webdavFileInfoRefresh:', filePath, webdavFileInfo)
+      if (webdavFileInfo && webdavFileInfo.size * 1 > 0) {
+        webdavFileInfo.path = filePath
+        await cacheFileInfo(webdavFileInfo)
+        fileInfo = webdavFileInfo
+      }
+    }
     if (fileInfo) {
       request.fileSize = fileInfo.size * 1
     } else if (request.headers.authorization) {
@@ -239,9 +271,10 @@ async function proxyHandle(ctx, next) {
         webdavFileInfo.path = filePath
         // 某些get请求返回的size=0，不要缓存起来
         if (webdavFileInfo.size * 1 > 0) {
-          cacheFileInfo(webdavFileInfo)
+          await cacheFileInfo(webdavFileInfo)
         }
         request.fileSize = webdavFileInfo.size * 1
+        fileInfo = webdavFileInfo
       }
     }
     request.passwdInfo = passwdInfo
@@ -252,7 +285,27 @@ async function proxyHandle(ctx, next) {
     }
     let flowEnc = null
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, request.fileSize, range)
+      const cachedZipInfo = deserializeWinZipAesZipInfo(fileInfo && fileInfo.zipInfo)
+      flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, request.fileSize, range, cachedZipInfo)
+      if (
+        fileInfo &&
+        request.zipInfo &&
+        (!cachedZipInfo || Number(cachedZipInfo.totalSize) !== Number(request.fileSize))
+      ) {
+        await cacheFileInfo({
+          ...fileInfo,
+          plainSize: request.zipInfo.plainSize,
+          zipInfo: serializeWinZipAesZipInfo(request.zipInfo),
+        })
+      }
+      if (request.method.toLocaleUpperCase() === 'HEAD') {
+        applyWinZipAesHeadResponse(response, request)
+        response.end()
+        return
+      }
+      if (request.isWebdav) {
+        request.followRemoteRedirect = true
+      }
     } else {
       flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize)
       if (start) {

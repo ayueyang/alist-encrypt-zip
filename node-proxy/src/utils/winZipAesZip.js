@@ -389,12 +389,21 @@ function parseRange(rangeHeader, totalSize) {
 function sanitizeForwardHeaders(headers = {}, options = {}) {
   const result = { ...headers }
   delete result.host
+  delete result.Host
   delete result.range
   delete result.Range
   delete result['content-length']
+  delete result['Content-Length']
   delete result['content-range']
+  delete result['Content-Range']
   delete result['transfer-encoding']
+  delete result['Transfer-Encoding']
   delete result['accept-encoding']
+  delete result['Accept-Encoding']
+  delete result['content-type']
+  delete result['Content-Type']
+  delete result.depth
+  delete result.Depth
   if (options.stripAuth) {
     delete result.authorization
     delete result.Authorization
@@ -409,10 +418,15 @@ function requestBuffer(urlAddr, options, redirectCount = 0) {
     const urlObj = new URL(urlAddr)
     const httpRequest = urlObj.protocol === 'https:' ? https : http
     const { maxBytes, ...requestOptions } = options
+    const headers = { ...(requestOptions.headers || {}) }
+    if (urlAddr.includes('baidupcs.com')) {
+      headers['User-Agent'] = 'pan.baidu.com'
+    }
     const req = httpRequest.request(
       urlObj,
       {
         ...requestOptions,
+        headers,
         rejectUnauthorized: false,
       },
       (resp) => {
@@ -420,10 +434,19 @@ function requestBuffer(urlAddr, options, redirectCount = 0) {
         if (resp.statusCode >= 300 && resp.statusCode < 400 && location && redirectCount < 5) {
           resp.resume()
           const nextUrl = new URL(location, urlObj).toString()
+          const nextUrlObj = new URL(nextUrl)
           const nextOptions = { ...options, headers: { ...(options.headers || {}) } }
           delete nextOptions.headers.host
-          delete nextOptions.headers.authorization
-          delete nextOptions.headers.referer
+          delete nextOptions.headers.Host
+          if (urlObj.host !== nextUrlObj.host) {
+            delete nextOptions.headers.authorization
+            delete nextOptions.headers.Authorization
+            delete nextOptions.headers.referer
+            delete nextOptions.headers.Referer
+          }
+          if (nextUrl.includes('baidupcs.com')) {
+            nextOptions.headers['User-Agent'] = 'pan.baidu.com'
+          }
           requestBuffer(nextUrl, nextOptions, redirectCount + 1).then(resolve).catch(reject)
           return
         }
@@ -687,7 +710,7 @@ export function serializeWinZipAesZipInfo(zipInfo) {
 }
 
 export function deserializeWinZipAesZipInfo(zipInfo) {
-  if (!zipInfo) return null
+  if (!zipInfo || !isWinZipAesEncType(zipInfo.encType)) return null
   return {
     ...zipInfo,
     salt: zipInfo.salt ? Buffer.from(zipInfo.salt, 'hex') : undefined,

@@ -13,6 +13,23 @@ const Agents = https.Agent
 const httpsAgent = new Agents({ keepAlive: true })
 const httpAgent = new Agent({ keepAlive: true })
 
+function prepareRedirectHeaders(request, redirectUrl) {
+  const sourceUrl = new URL(request.urlAddr)
+  const targetUrl = new URL(redirectUrl, sourceUrl)
+  delete request.headers.host
+  delete request.headers.Host
+  if (sourceUrl.host !== targetUrl.host) {
+    delete request.headers.authorization
+    delete request.headers.Authorization
+    delete request.headers.referer
+    delete request.headers.Referer
+  }
+  if (targetUrl.hostname.includes('baidupcs.com')) {
+    request.headers['User-Agent'] = 'pan.baidu.com'
+  }
+  request.urlAddr = targetUrl.toString()
+}
+
 export async function httpProxy(request, response, encryptTransform, decryptTransform) {
   const { method, headers, urlAddr, passwdInfo, url, fileSize } = request
   const reqId = randomUUID()
@@ -29,6 +46,21 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
     // 处理重定向的请求，让下载的流量经过代理服务器
     const httpReq = httpRequest.request(urlAddr, options, async (httpResp) => {
       console.log('@@statusCode', reqId, httpResp.statusCode, httpResp.headers)
+      const redirectLocation = httpResp.headers.location || ''
+      if (
+        request.followRemoteRedirect &&
+        decryptTransform &&
+        httpResp.statusCode >= 300 &&
+        httpResp.statusCode < 400 &&
+        redirectLocation &&
+        (request.remoteRedirectCount || 0) < 5
+      ) {
+        httpResp.resume()
+        request.remoteRedirectCount = (request.remoteRedirectCount || 0) + 1
+        prepareRedirectHeaders(request, redirectLocation)
+        httpProxy(request, response, null, decryptTransform).then(resolve).catch(reject)
+        return
+      }
       response.statusCode = httpResp.statusCode
       if (response.statusCode % 300 < 5) {
         // 可能出现304，redirectUrl = undefined
@@ -61,11 +93,13 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
       }
       applyWinZipAesResponseHeaders(response, request)
       // 下载时解密文件名
-      if (method === 'GET' && response.statusCode === 200 && passwdInfo && passwdInfo.enable && passwdInfo.encName) {
-        let fileName = decodeURIComponent(path.basename(url))
-        fileName = isWinZipAesEncType(passwdInfo.encType)
-          ? convertShowName(passwdInfo.password, passwdInfo.encType, fileName)
-          : decodeName(passwdInfo.password, passwdInfo.encType, fileName.replace(path.extname(fileName), ''))
+      if (method === 'GET' && response.statusCode < 300 && passwdInfo && passwdInfo.enable && passwdInfo.encName) {
+        let fileName = request.zipVirtualName || decodeURIComponent(path.basename(url))
+        if (!request.zipVirtualName) {
+          fileName = isWinZipAesEncType(passwdInfo.encType)
+            ? convertShowName(passwdInfo.password, passwdInfo.encType, fileName)
+            : decodeName(passwdInfo.password, passwdInfo.encType, fileName.replace(path.extname(fileName), ''))
+        }
         if (fileName) {
           let cd = response.getHeader('content-disposition')
           cd = cd ? cd.replace(/filename\*?=[^=;]*;?/g, '') : ''
@@ -90,7 +124,11 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
       console.log('@@httpProxy request error ', reqId, err, urlAddr, headers)
     })
     // 是否需要加密
-    encryptTransform ? request.pipe(encryptTransform).pipe(httpReq) : request.pipe(httpReq)
+    if (request.followRemoteRedirect && ['GET', 'HEAD'].includes(String(method).toLocaleUpperCase())) {
+      httpReq.end()
+    } else {
+      encryptTransform ? request.pipe(encryptTransform).pipe(httpReq) : request.pipe(httpReq)
+    }
     // 重定向的请求 关闭时 关闭被重定向的请求
     response.on('close', () => {
       console.log('@本地响应关闭...', reqId, url)
