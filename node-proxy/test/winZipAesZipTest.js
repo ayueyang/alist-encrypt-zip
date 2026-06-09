@@ -110,6 +110,7 @@ async function main() {
   assert.ok(!encryptedName.endsWith('.mp4.zip'))
   assert.strictEqual(convertShowName(password, ZIP_AES_ENC_TYPE, encryptedName), '电影.final 4k.mp4')
   assert.ok(isEncryptedZipName(password, ZIP_AES_ENC_TYPE, encryptedName))
+  assert.ok(!isRawZipName(password, ZIP_AES_ENC_TYPE, encryptedName))
   assert.ok(isRawZipName(password, ZIP_AES_ENC_TYPE, 'abc.zip'))
   assert.ok(isRawZipName(password, ZIP_AES_ENC_TYPE, 'abc.mp4.zip'))
   assert.strictEqual(getAListFileTypeByName('电影.final 4k.mp4'), 2)

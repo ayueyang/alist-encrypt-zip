@@ -220,6 +220,9 @@ encNameRouter.all('/api/fs/remove', bodyparserMw, async (ctx, next) => {
   const fileNames = Object.assign([], names)
   if (passwdInfo && passwdInfo.encName) {
     for (const name of names) {
+      if (isRawZipName(passwdInfo, name)) {
+        continue
+      }
       // is not enc name
       const realName = convertRealName(passwdInfo.password, passwdInfo.encType, name)
       fileNames.push(realName)
