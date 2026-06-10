@@ -69,6 +69,21 @@ export async function cacheExternalWinZipAesZipInfo(fileInfo, zipInfo) {
   return nextFileInfo
 }
 
+export async function cacheManagedWinZipAesZipInfo(fileInfo, zipInfo) {
+  const nextFileInfo = {
+    ...fileInfo,
+    path: normalizePath(fileInfo.path),
+    name: fileInfo.name || path.basename(fileInfo.path),
+    size: normalizeSize(fileInfo.size),
+    plainSize: zipInfo.plainSize,
+    zipInfo: serializeWinZipAesZipInfo(zipInfo),
+    externalZip: false,
+    zipVirtualName: fileInfo.zipVirtualName,
+  }
+  await cacheFileInfo(nextFileInfo)
+  return nextFileInfo
+}
+
 export async function cacheExternalWinZipAesZipNegative(fileInfo, error) {
   await levelDB.setExpire(
     probeKey(fileInfo.path),

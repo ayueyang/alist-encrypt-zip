@@ -19,6 +19,7 @@ import WinZipAesZip, {
   deserializeWinZipAesZipInfo,
   getMimeByName,
   isWinZipAesEncType,
+  parseManagedWinZipAesZipInfoFromRemote,
   parseWinZipAesZipInfoFromRemote,
   prepareWinZipAesDownloadRequest,
   serializeWinZipAesZipInfo,
@@ -38,7 +39,9 @@ import { logger } from '@/common/logger'
 import {
   cacheExternalWinZipAesZipInfo,
   cacheExternalWinZipAesZipNegative,
+  cacheManagedWinZipAesZipInfo,
   getWinZipAesZipProbeCache,
+  isUsableWinZipAesZipInfoCache,
 } from '@/utils/winZipAesZipCache'
 
 async function sleep(time) {
@@ -94,6 +97,31 @@ async function prepareExternalWinZipAesZipInfo(request, fileInfo, parseUrl, head
     await cacheExternalWinZipAesZipNegative(fileInfo, e)
     return null
   }
+}
+
+async function prepareManagedWinZipAesZipInfo(request, passwdInfo, fileInfo, parseUrl, headers, options = {}) {
+  const enableZipInfoCache = passwdInfo.zipInfoCache !== false
+  if (enableZipInfoCache) {
+    const cachedFileInfo = (await getFileInfo(fileInfo.path)) || (await getFileInfo(encodeURIComponent(fileInfo.path)))
+    if (isUsableWinZipAesZipInfoCache(cachedFileInfo, fileInfo.size)) {
+      return cachedFileInfo
+    }
+  }
+  let zipInfo
+  try {
+    zipInfo = await parseManagedWinZipAesZipInfoFromRemote(parseUrl, headers, fileInfo.size, options)
+  } catch (e) {
+    zipInfo = await parseWinZipAesZipInfoFromRemote(parseUrl, headers, fileInfo.size, options)
+  }
+  const nextFileInfo = {
+    ...fileInfo,
+    plainSize: zipInfo.plainSize,
+    zipInfo: serializeWinZipAesZipInfo(zipInfo),
+  }
+  if (!enableZipInfoCache) {
+    return nextFileInfo
+  }
+  return await cacheManagedWinZipAesZipInfo(nextFileInfo, zipInfo)
 }
 
 function applyWinZipAesHeadResponse(response, request) {
@@ -427,7 +455,22 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
         }
         zipInfo = deserializeWinZipAesZipInfo(cachedOrParsed.zipInfo)
       } else {
-        zipInfo = await parseWinZipAesZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize, { stripAuth: true })
+        const cachedOrParsed = await prepareManagedWinZipAesZipInfo(
+          ctx.req,
+          passwdInfo,
+          {
+            ...result.data,
+            path,
+            name: path.split('/').pop(),
+            is_dir: false,
+            size: remoteFileSize,
+            zipVirtualName: decodeURIComponent((ctx.req.encVirtualPath || path).split('/').pop() || ''),
+          },
+          result.data.raw_url,
+          ctx.req.headers,
+          { stripAuth: true }
+        )
+        zipInfo = deserializeWinZipAesZipInfo(cachedOrParsed.zipInfo)
       }
       result.data.size = zipInfo.plainSize
     }

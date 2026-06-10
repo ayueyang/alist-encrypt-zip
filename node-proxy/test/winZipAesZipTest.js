@@ -15,6 +15,7 @@ import {
 } from '../src/utils/commonUtil'
 import {
   isWinZipAesEncType,
+  parseManagedWinZipAesZipInfoFromFile,
   parseWinZipAesZipInfoFromFile,
   prepareWinZipAesDownloadRequest,
   ZIP_AES_ENC_TYPE,
@@ -126,6 +127,7 @@ async function main() {
   const plain = Buffer.concat([Buffer.from('ftypisom'), crypto.randomBytes(512 * 1024 + 37), Buffer.from('zip aes tail')])
   const { zipPath } = await createZip(plain)
   const zipInfo = await parseWinZipAesZipInfoFromFile(zipPath)
+  const managedZipInfo = await parseManagedWinZipAesZipInfoFromFile(zipPath)
 
   assert.strictEqual(zipInfo.encType, ZIP_AES_ENC_TYPE)
   assert.strictEqual(zipInfo.innerName, 'payload.mp4')
@@ -134,6 +136,11 @@ async function main() {
   assert.strictEqual(zipInfo.winZipAes.strength, 3)
   assert.strictEqual(zipInfo.salt.length, 16)
   assert.strictEqual(zipInfo.compressedSize, plain.length + 28)
+  assert.strictEqual(managedZipInfo.innerName, zipInfo.innerName)
+  assert.strictEqual(managedZipInfo.plainSize, zipInfo.plainSize)
+  assert.strictEqual(managedZipInfo.payloadOffset, zipInfo.payloadOffset)
+  assert.strictEqual(managedZipInfo.authTagOffset, zipInfo.authTagOffset)
+  assert.deepStrictEqual(managedZipInfo.salt, zipInfo.salt)
 
   const pyCheck = [
     'import pathlib, pyzipper, sys',
