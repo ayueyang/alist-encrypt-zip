@@ -51,14 +51,6 @@
               <!-- 后缀
               <el-input v-model="item.encSuffix" style="max-width: 150px; margin-left: 10px" placeholder="默认原文件名后缀" /> -->
             </el-form-item>
-            <el-form-item v-if="item.encType === 'winzip-aes-ctr'" label="ZIP缓存">
-              自动
-              <el-switch
-                v-model="item.zipAutoCache"
-                class="ml-2"
-                style="margin-right: 10px; --el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949"
-              />
-            </el-form-item>
             <el-form-item label="备注">
               <el-input v-model="item.describe" style="max-width: 260px; margin-right: 10px" placeholder="备注描述" />
             </el-form-item>
@@ -128,7 +120,6 @@ const configTemp = {
       encType: 'aesctr',
       enable: false,
       encName: false, // encrypt file name
-      zipAutoCache: false,
       encSuffix: '', //
       describe: 'my video',
       encPath: '/aliyun/encrypt/*'
@@ -145,7 +136,6 @@ const addPasswd = () => {
     password: '123456',
     encType: 'aesctr',
     enable: true,
-    zipAutoCache: false,
     describe: 'my video',
     encPath: '/dav/encrypt/*'
   })

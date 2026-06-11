@@ -675,69 +675,6 @@ export async function parseWinZipAesZipInfoFromReader(readRange, totalSize) {
   }
 }
 
-export async function parseManagedWinZipAesZipInfoFromReader(readRange, totalSize) {
-  const firstSize = Math.min(4096, totalSize)
-  let first = await readRange(0, firstSize)
-  const ensureFirstBytes = async (length) => {
-    if (first.length >= length) return first.subarray(0, length)
-    const next = await readRange(first.length, length - first.length)
-    first = Buffer.concat([first, next])
-    return first.subarray(0, length)
-  }
-
-  const fixed = await ensureFirstBytes(30)
-  if (fixed.length < 30 || fixed.readUInt32LE(0) !== 0x04034b50) {
-    throw new Error('ZIP local header is invalid')
-  }
-  const nameLen = fixed.readUInt16LE(26)
-  const extraLen = fixed.readUInt16LE(28)
-  const headerSize = 30 + nameLen + extraLen
-  const header = await ensureFirstBytes(headerSize)
-  const local = parseLocalHeaderBytes(fixed, header.subarray(30, headerSize), 0)
-  const winZipAes = parseWinZipAesExtra(local.extra)
-  if (!winZipAes) {
-    throw new Error('WinZip AES extra field not found')
-  }
-  if (winZipAes.vendor !== WINZIP_AES_VENDOR.toString('ascii')) {
-    throw new Error('WinZip AES vendor is invalid')
-  }
-  if ((local.flags & 1) === 0) {
-    throw new Error('ZIP entry is not encrypted')
-  }
-  if (local.method !== WINZIP_AES_METHOD) {
-    throw new Error('ZIP entry is not WinZip AES')
-  }
-  if (winZipAes.actualMethod !== STORE_METHOD) {
-    throw new Error('WinZip AES playback requires store method')
-  }
-
-  const saltLen = winZipAesSaltSize(winZipAes.strength)
-  const dataHeaderSize = saltLen + WINZIP_AES_VERIFY_SIZE
-  const authSize = WINZIP_AES_AUTH_SIZE
-  const plainSize = local.uncompressedSize
-  const compressedSize = local.compressedSize
-  if (compressedSize - dataHeaderSize - authSize !== plainSize) {
-    throw new Error('WinZip-AES-CTR ZIP is not store-compatible')
-  }
-  const saltOffset = local.headerSize
-  const saltBytes = await ensureFirstBytes(saltOffset + saltLen)
-  return {
-    encType: ZIP_AES_ENC_TYPE,
-    innerName: local.name || INNER_FILENAME,
-    salt: saltBytes.subarray(saltOffset, saltOffset + saltLen),
-    winZipAes,
-    headerSize: local.headerSize,
-    localHeaderOffset: 0,
-    payloadOffset: saltOffset + dataHeaderSize,
-    payloadSize: plainSize,
-    authTagOffset: saltOffset + compressedSize - authSize,
-    authSize,
-    plainSize,
-    compressedSize,
-    totalSize,
-  }
-}
-
 export async function parseWinZipAesZipInfoFromFile(filePath) {
   const fs = await import('fs')
   const stat = await fs.promises.stat(filePath)
@@ -754,59 +691,18 @@ export async function parseWinZipAesZipInfoFromFile(filePath) {
   }
 }
 
-export async function parseManagedWinZipAesZipInfoFromFile(filePath) {
-  const fs = await import('fs')
-  const stat = await fs.promises.stat(filePath)
-  const handle = await fs.promises.open(filePath, 'r')
-  try {
-    const readRange = async (start, length) => {
-      const buffer = Buffer.alloc(length)
-      const result = await handle.read(buffer, 0, length, start)
-      return buffer.subarray(0, result.bytesRead)
-    }
-    return await parseManagedWinZipAesZipInfoFromReader(readRange, stat.size)
-  } finally {
-    await handle.close()
-  }
-}
-
 export async function parseWinZipAesZipInfoFromRemote(urlAddr, headers = {}, candidateSize = 0, options = {}) {
   const totalSize = await getRemoteSize(urlAddr, headers, Number(candidateSize) || 0, options)
   const readRange = (start, length) => readRemoteRange(urlAddr, headers, start, length, options)
   return await parseWinZipAesZipInfoFromReader(readRange, totalSize)
 }
 
-export async function parseManagedWinZipAesZipInfoFromRemote(urlAddr, headers = {}, candidateSize = 0, options = {}) {
-  const totalSize = await getRemoteSize(urlAddr, headers, Number(candidateSize) || 0, options)
-  const readRange = (start, length) => readRemoteRange(urlAddr, headers, start, length, options)
-  return await parseManagedWinZipAesZipInfoFromReader(readRange, totalSize)
-}
-
 export function isWinZipAesEncType(encType) {
   return encType === ZIP_AES_ENC_TYPE
 }
 
-export function serializeWinZipAesZipInfo(zipInfo) {
-  if (!zipInfo) return null
-  return {
-    ...zipInfo,
-    salt: zipInfo.salt ? Buffer.from(zipInfo.salt).toString('hex') : undefined,
-  }
-}
-
-export function deserializeWinZipAesZipInfo(zipInfo) {
-  if (!zipInfo || !isWinZipAesEncType(zipInfo.encType)) return null
-  return {
-    ...zipInfo,
-    salt: zipInfo.salt ? Buffer.from(zipInfo.salt, 'hex') : undefined,
-  }
-}
-
 export function getMimeByName(name = '') {
-  let fileName = String(name).split('?')[0]
-  if (fileName.toLowerCase().endsWith('.zip')) {
-    fileName = fileName.slice(0, -4)
-  }
+  const fileName = String(name).split('?')[0]
   const ext = path.extname(fileName).toLowerCase()
   return MIME_MAP[ext] || 'application/octet-stream'
 }
@@ -835,7 +731,7 @@ export function applyWinZipAesResponseHeaders(response, request) {
   if (zipPlainRange.hasRange) {
     response.statusCode = 206
     response.setHeader('content-range', `bytes ${zipPlainRange.start}-${zipPlainRange.end}/${zipInfo.plainSize}`)
-  } else if (response.statusCode < 300) {
+  } else if (response.statusCode < 300 || String(request.method).toLocaleUpperCase() === 'HEAD') {
     response.statusCode = 200
     response.removeHeader('content-range')
   }

@@ -4,7 +4,6 @@ import path from 'path'
 
 import MixBase64 from './mixBase64'
 import Crcn from './crc6-8'
-import { isWinZipAesEncType } from './winZipAesZip'
 
 const crc6 = new Crcn(6)
 const origPrefix = 'orig_'
@@ -19,62 +18,23 @@ export function convertRealName(password: string, encType: string, pathText: str
   const ext = path.extname(fileName)
   const encName = encodeName(password, encType, decodeURIComponent(fileName))
   console.log('@@decodeURI(fileName)', decodeURIComponent(fileName))
-  if (isWinZipAesEncType(encType)) {
-    return encName + '.zip'
-  }
   return encName + ext
 }
 
 // if file name has encrypt, return show name
 export function convertShowName(password: string, encType: string, pathText: string) {
-  const rawFileName = path.basename(decodeURIComponent(pathText))
-  let fileName = rawFileName
-  if (isWinZipAesEncType(encType) && fileName.toLowerCase().endsWith('.zip')) {
-    fileName = fileName.slice(0, -4)
-  }
-  const ext = isWinZipAesEncType(encType) ? '' : path.extname(fileName)
-  const encName = ext ? fileName.replace(ext, '') : fileName
+  const fileName = path.basename(decodeURIComponent(pathText))
+  const ext = path.extname(fileName)
+  const encName = fileName.replace(ext, '')
   // encName don't need decodeURI
   let showName = decodeName(password, encType, encName)
   if (showName === null) {
-    showName = origPrefix + rawFileName
+    showName = origPrefix + fileName
   }
   return showName
 }
 
 // 判断是否为匹配的路径
-export function isOrigName(fileName: string) {
-  return path.basename(fileName).indexOf(origPrefix) === 0
-}
-
-export function getOrigName(fileName: string) {
-  return path.basename(fileName).replace(origPrefix, '')
-}
-
-export function isEncryptedZipName(password: string, encType: string, fileName: string) {
-  if (!isWinZipAesEncType(encType)) return false
-  if (!String(fileName).toLowerCase().endsWith('.zip')) return false
-  const showName = convertShowName(password, encType, fileName)
-  return !!showName && !isOrigName(showName) && convertRealName(password, encType, showName) === path.basename(fileName)
-}
-
-export function isRawZipName(password: string, encType: string, fileName: string) {
-  return (
-    isWinZipAesEncType(encType) &&
-    String(fileName || '').toLowerCase().endsWith('.zip') &&
-    !isEncryptedZipName(password, encType, fileName)
-  )
-}
-
-export function getAListFileTypeByName(fileName = '') {
-  const ext = path.extname(String(fileName).split('?')[0]).toLowerCase()
-  if (['.mp4', '.m4v', '.webm', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.ts', '.mpg', '.mpeg'].includes(ext)) return 2
-  if (['.mp3', '.m4a', '.aac', '.flac', '.wav', '.ogg'].includes(ext)) return 3
-  if (['.txt', '.md', '.json', '.js', '.ts', '.css', '.html', '.xml', '.log'].includes(ext)) return 4
-  if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'].includes(ext)) return 5
-  return 0
-}
-
 export function pathExec(encPath: string[], url: string) {
   for (const filePath of encPath) {
     const result = pathToRegexp(new RegExp(filePath)).exec(url)

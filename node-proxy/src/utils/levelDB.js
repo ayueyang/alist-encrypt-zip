@@ -48,7 +48,7 @@ class Nedb {
 const nedb = new Nedb(process.cwd() + '/conf/nedb/datafile')
 
 // 定时清除过期的数据
-const expireTimer = setInterval(async () => {
+setInterval(async () => {
   const allData = await nedb.datastore.find({})
   for (const data of allData) {
     const { key, expire } = data
@@ -58,6 +58,5 @@ const expireTimer = setInterval(async () => {
     }
   }
 }, 30 * 1000)
-expireTimer.unref && expireTimer.unref()
 
 export default nedb

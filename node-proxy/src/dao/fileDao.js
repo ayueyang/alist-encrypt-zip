@@ -9,23 +9,11 @@ const cacheTime = 60 * 24
 export async function initFileTable() {}
 
 // 缓存文件信息
-export async function cacheFileInfo(fileInfo, expireSeconds = 1000 * 60 * cacheTime) {
+export async function cacheFileInfo(fileInfo) {
   fileInfo.path = decodeURIComponent(fileInfo.path)
   const pathKey = fileInfoTable + fileInfo.path
-  const cachedFileInfo = await levelDB.getValue(pathKey)
-  if (
-    cachedFileInfo &&
-    cachedFileInfo.zipInfo &&
-    !fileInfo.zipInfo &&
-    Number(cachedFileInfo.size) === Number(fileInfo.size)
-  ) {
-    fileInfo.plainSize = cachedFileInfo.plainSize
-    fileInfo.zipInfo = cachedFileInfo.zipInfo
-    fileInfo.externalZip = cachedFileInfo.externalZip
-    fileInfo.zipVirtualName = cachedFileInfo.zipVirtualName
-  }
   fileInfo.table = fileInfoTable
-  await levelDB.setExpire(pathKey, fileInfo, expireSeconds)
+  await levelDB.setExpire(pathKey, fileInfo, 1000 * 60 * cacheTime)
 }
 
 // 获取文件信息，偶尔要清理一下缓存

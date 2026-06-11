@@ -16,17 +16,14 @@ import { httpProxy, httpClient } from '@/utils/httpClient'
 import bodyparser from 'koa-bodyparser'
 import FlowEnc from '@/utils/flowEnc'
 import WinZipAesZip, {
-  deserializeWinZipAesZipInfo,
-  getMimeByName,
+  applyWinZipAesResponseHeaders,
   isWinZipAesEncType,
-  parseManagedWinZipAesZipInfoFromRemote,
   parseWinZipAesZipInfoFromRemote,
   prepareWinZipAesDownloadRequest,
-  serializeWinZipAesZipInfo,
 } from '@/utils/winZipAesZip'
 import levelDB from '@/utils/levelDB'
 import { webdavServer, alistServer, port, version } from '@/config'
-import { convertRealName, getAListFileTypeByName, isRawZipName, pathExec, pathFindPasswd } from '@/utils/commonUtil'
+import { pathExec, pathFindPasswd } from '@/utils/commonUtil'
 import globalHandle from '@/middleware/globalHandle'
 import encApiRouter from '@/router'
 import encNameRouter from '@/encNameRouter'
@@ -36,13 +33,7 @@ import { cacheFileInfo, getFileInfo } from '@/dao/fileDao'
 import { getWebdavFileInfo } from '@/utils/webdavClient'
 import staticServer from 'koa-static'
 import { logger } from '@/common/logger'
-import {
-  cacheExternalWinZipAesZipInfo,
-  cacheExternalWinZipAesZipNegative,
-  cacheManagedWinZipAesZipInfo,
-  getWinZipAesZipProbeCache,
-  isUsableWinZipAesZipInfoCache,
-} from '@/utils/winZipAesZipCache'
+import { encodeName } from '@/utils/commonUtil'
 
 async function sleep(time) {
   return new Promise((resolve) => {
@@ -65,77 +56,15 @@ function setWinZipAesUploadSize(request, passwdInfo, plainSize, originalName) {
   delete request.headers['x-expected-entity-length']
 }
 
-async function prepareWinZipAesDecrypt(request, passwdInfo, zipSize, rangeHeader, cachedZipInfo = null) {
-  const validCachedZipInfo =
-    cachedZipInfo && Number(cachedZipInfo.totalSize) === Number(zipSize) ? cachedZipInfo : null
-  const zipInfo =
-    validCachedZipInfo ||
-    (await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, zipSize))
+async function prepareWinZipAesDecrypt(request, passwdInfo, zipSize, rangeHeader) {
+  const zipInfo = await parseWinZipAesZipInfoFromRemote(request.urlAddr, request.headers, zipSize)
   request.zipVirtualName =
-    request.zipVirtualName ||
-    (request.isExternalZip || request.isExternalZipCandidate
-      ? zipInfo.innerName
-      : path.basename(decodeURIComponent(request.url.split('?')[0] || zipInfo.innerName)))
+    request.zipVirtualName || path.basename(decodeURIComponent(request.url.split('?')[0] || zipInfo.innerName))
   prepareWinZipAesDownloadRequest(request, zipInfo, rangeHeader)
+  request.beforeResponseHeaders = applyWinZipAesResponseHeaders
   const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, zipInfo.plainSize, { zipInfo })
   await flowEnc.setPosition(request.zipCipherStart || 0)
   return flowEnc
-}
-
-async function prepareExternalWinZipAesZipInfo(request, fileInfo, parseUrl, headers, options = {}) {
-  const probeCache = await getWinZipAesZipProbeCache(fileInfo.path, fileInfo.size)
-  if (probeCache.type === 'hit') {
-    return probeCache.fileInfo
-  }
-  if (probeCache.type === 'negative') {
-    return null
-  }
-  try {
-    const zipInfo = await parseWinZipAesZipInfoFromRemote(parseUrl, headers, fileInfo.size, options)
-    return await cacheExternalWinZipAesZipInfo(fileInfo, zipInfo)
-  } catch (e) {
-    await cacheExternalWinZipAesZipNegative(fileInfo, e)
-    return null
-  }
-}
-
-async function prepareManagedWinZipAesZipInfo(request, passwdInfo, fileInfo, parseUrl, headers, options = {}) {
-  const enableZipInfoCache = passwdInfo.zipInfoCache !== false
-  if (enableZipInfoCache) {
-    const cachedFileInfo = (await getFileInfo(fileInfo.path)) || (await getFileInfo(encodeURIComponent(fileInfo.path)))
-    if (isUsableWinZipAesZipInfoCache(cachedFileInfo, fileInfo.size)) {
-      return cachedFileInfo
-    }
-  }
-  let zipInfo
-  try {
-    zipInfo = await parseManagedWinZipAesZipInfoFromRemote(parseUrl, headers, fileInfo.size, options)
-  } catch (e) {
-    zipInfo = await parseWinZipAesZipInfoFromRemote(parseUrl, headers, fileInfo.size, options)
-  }
-  const nextFileInfo = {
-    ...fileInfo,
-    plainSize: zipInfo.plainSize,
-    zipInfo: serializeWinZipAesZipInfo(zipInfo),
-  }
-  if (!enableZipInfoCache) {
-    return nextFileInfo
-  }
-  return await cacheManagedWinZipAesZipInfo(nextFileInfo, zipInfo)
-}
-
-function applyWinZipAesHeadResponse(response, request) {
-  const { zipInfo, zipPlainRange } = request
-  if (!zipInfo || !zipPlainRange) return
-  response.statusCode = zipPlainRange.hasRange ? 206 : 200
-  if (zipPlainRange.hasRange) {
-    response.setHeader('content-range', `bytes ${zipPlainRange.start}-${zipPlainRange.end}/${zipInfo.plainSize}`)
-  } else {
-    response.removeHeader('content-range')
-  }
-  response.setHeader('accept-ranges', 'bytes')
-  response.setHeader('content-length', String(Math.max(0, zipPlainRange.end - zipPlainRange.start + 1)))
-  response.setHeader('content-type', getMimeByName(request.zipVirtualName || request.url))
 }
 
 const proxyRouter = new Router()
@@ -165,7 +94,7 @@ proxyRouter.all('/redirect/:key', async (ctx) => {
     ctx.body = 'no found'
     return
   }
-  const { passwdInfo, redirectUrl, fileSize, virtualName, zipInfo: cachedZipInfoData } = data
+  const { passwdInfo, redirectUrl, fileSize, virtualName } = data
   // 要定位请求文件的位置 bytes=98304-
   const range = request.headers.range
   const start = getRangeStart(range)
@@ -193,7 +122,7 @@ proxyRouter.all('/redirect/:key', async (ctx) => {
   if (shouldDecode) {
     let flowEnc = null
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, fileSize, range, deserializeWinZipAesZipInfo(cachedZipInfoData))
+      flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, fileSize, range)
     } else {
       flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, fileSize)
       if (start) {
@@ -278,21 +207,18 @@ async function proxyHandle(ctx, next) {
     }
     // 尝试获取文件信息，如果未找到相应的文件信息，则对文件名进行加密处理后重新尝试获取文件信息
     let fileInfo = await getFileInfo(filePath);
-    const requestedFileName = decodeURIComponent(path.basename(filePath))
 
     if (fileInfo === null) {
-      if (!isWinZipAesEncType(passwdInfo.encType) || !requestedFileName.toLowerCase().endsWith('.zip')) {
-        const encodedRawFileName = encodeURIComponent(requestedFileName);
-        const newFileName = convertRealName(passwdInfo.password, passwdInfo.encType, requestedFileName);
+      const rawFileName = decodeURIComponent(path.basename(filePath));
+      const ext = path.extname(rawFileName);
+      const encodedRawFileName = encodeURIComponent(rawFileName);
+      const encFileName = encodeName(passwdInfo.password, passwdInfo.encType, rawFileName);
+      const newFileName = encFileName + ext;
 
-        filePath = filePath.replace(encodedRawFileName, newFileName);
-        request.urlAddr = request.urlAddr.replace(encodedRawFileName, newFileName);
+      filePath = filePath.replace(encodedRawFileName, newFileName);
+      request.urlAddr = request.urlAddr.replace(encodedRawFileName, newFileName);
 
-        fileInfo = await getFileInfo(filePath);
-      }
-    }
-    if (isRawZipName(passwdInfo.password, passwdInfo.encType, requestedFileName)) {
-      request.isExternalZipCandidate = true
+      fileInfo = await getFileInfo(filePath);
     }
     logger.info('@@getFileInfo:', filePath, fileInfo, request.urlAddr)
     if (
@@ -312,10 +238,6 @@ async function proxyHandle(ctx, next) {
     }
     if (fileInfo) {
       request.fileSize = fileInfo.size * 1
-      if (fileInfo.externalZip) {
-        request.isExternalZip = true
-        request.zipVirtualName = fileInfo.zipInfo && fileInfo.zipInfo.innerName
-      }
     } else if (request.headers.authorization) {
       // 这里要判断是否webdav进行请求, 这里默认就是webdav请求了
       const authorization = request.headers.authorization
@@ -325,10 +247,9 @@ async function proxyHandle(ctx, next) {
         webdavFileInfo.path = filePath
         // 某些get请求返回的size=0，不要缓存起来
         if (webdavFileInfo.size * 1 > 0) {
-          await cacheFileInfo(webdavFileInfo)
+          cacheFileInfo(webdavFileInfo)
         }
         request.fileSize = webdavFileInfo.size * 1
-        fileInfo = webdavFileInfo
       }
     }
     request.passwdInfo = passwdInfo
@@ -339,44 +260,11 @@ async function proxyHandle(ctx, next) {
     }
     let flowEnc = null
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      if (request.isExternalZipCandidate && !(fileInfo && fileInfo.externalZip)) {
-        const externalFileInfo = await prepareExternalWinZipAesZipInfo(
-          request,
-          fileInfo || {
-            path: filePath,
-            name: path.basename(filePath),
-            is_dir: false,
-            size: request.fileSize,
-            zipVirtualName: path.basename(filePath),
-          },
-          request.urlAddr,
-          request.headers
-        )
-        if (!externalFileInfo || !externalFileInfo.zipInfo) {
-          logger.info('@@ordinary zip passthrough:', filePath)
-          return await httpProxy(request, response)
-        }
-        fileInfo = externalFileInfo
-        request.isExternalZip = true
-        request.zipVirtualName = externalFileInfo.zipInfo && externalFileInfo.zipInfo.innerName
-      }
-      const cachedZipInfo = deserializeWinZipAesZipInfo(fileInfo && fileInfo.zipInfo)
-      flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, request.fileSize, range, cachedZipInfo)
-      if (
-        fileInfo &&
-        request.zipInfo &&
-        (!cachedZipInfo || Number(cachedZipInfo.totalSize) !== Number(request.fileSize))
-      ) {
-        await cacheFileInfo({
-          ...fileInfo,
-          plainSize: request.zipInfo.plainSize,
-          zipInfo: serializeWinZipAesZipInfo(request.zipInfo),
-          externalZip: fileInfo.externalZip || request.isExternalZipCandidate,
-          zipVirtualName: fileInfo.zipVirtualName || (request.isExternalZipCandidate ? path.basename(filePath) : undefined),
-        })
-      }
+      request.zipVirtualName = request.zipVirtualName || decodeURIComponent(path.basename(filePath))
+      flowEnc = await prepareWinZipAesDecrypt(request, passwdInfo, request.fileSize, range)
+      request.redirectExtra = { virtualName: request.zipVirtualName }
       if (request.method.toLocaleUpperCase() === 'HEAD') {
-        applyWinZipAesHeadResponse(response, request)
+        applyWinZipAesResponseHeaders(response, request)
         response.end()
         return
       }
@@ -431,69 +319,27 @@ proxyRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     // 修改返回的响应，匹配到要解密，就302跳转到本服务上进行代理流量
     logger.info('@@getFile ', path, ctx.req.reqBody, result)
     const remoteFileSize = result.data.size
-    let zipInfo = null
+    const virtualName = decodeURIComponent((ctx.req.encVirtualPath || path).split('/').pop() || '')
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      if (ctx.req.isExternalZip && ctx.req.cachedExternalZipInfo) {
-        zipInfo = deserializeWinZipAesZipInfo(ctx.req.cachedExternalZipInfo)
-      } else if (ctx.req.isExternalZipCandidate) {
-        const cachedOrParsed = await prepareExternalWinZipAesZipInfo(
-          ctx.req,
-          {
-            path,
-            name: path.split('/').pop(),
-            is_dir: false,
-            size: remoteFileSize,
-            zipVirtualName: path.split('/').pop(),
-          },
-          result.data.raw_url,
-          ctx.req.headers,
-          { stripAuth: true }
-        )
-        if (!cachedOrParsed || !cachedOrParsed.zipInfo) {
-          ctx.body = result
-          return
-        }
-        zipInfo = deserializeWinZipAesZipInfo(cachedOrParsed.zipInfo)
-      } else {
-        const cachedOrParsed = await prepareManagedWinZipAesZipInfo(
-          ctx.req,
-          passwdInfo,
-          {
-            ...result.data,
-            path,
-            name: path.split('/').pop(),
-            is_dir: false,
-            size: remoteFileSize,
-            zipVirtualName: decodeURIComponent((ctx.req.encVirtualPath || path).split('/').pop() || ''),
-          },
-          result.data.raw_url,
-          ctx.req.headers,
-          { stripAuth: true }
-        )
-        zipInfo = deserializeWinZipAesZipInfo(cachedOrParsed.zipInfo)
-      }
+      const zipInfo = await parseWinZipAesZipInfoFromRemote(result.data.raw_url, ctx.req.headers, remoteFileSize, {
+        stripAuth: true,
+      })
       result.data.size = zipInfo.plainSize
     }
     const key = crypto.randomUUID()
-    const virtualName = decodeURIComponent((ctx.req.encVirtualPath || path).split('/').pop() || '')
-    const previewName = (ctx.req.isExternalZip || ctx.req.isExternalZipCandidate) && zipInfo ? zipInfo.innerName : virtualName
     await levelDB.setExpire(
       key,
       {
         redirectUrl: result.data.raw_url,
         passwdInfo,
         fileSize: remoteFileSize,
-        virtualName: previewName,
-        zipInfo: serializeWinZipAesZipInfo(zipInfo),
+        virtualName,
       },
       60 * 60 * 72
     ) // 缓存起来，默认3天，足够下载和观看了
     result.data.raw_url = `${
       headers.origin || (headers['x-forwarded-proto'] || ctx.protocol) + '://' + ctx.req.selfHost
     }/redirect/${key}?decode=1&lastUrl=${encodeURIComponent(path)}`
-    if (previewName) {
-      result.data.type = getAListFileTypeByName(previewName)
-    }
     if (isWinZipAesEncType(passwdInfo.encType) || result.data.provider === 'AliyundriveOpen') result.data.provider = 'Local'
   }
   ctx.body = result
