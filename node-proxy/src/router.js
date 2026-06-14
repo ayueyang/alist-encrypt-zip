@@ -4,7 +4,7 @@ import Router from 'koa-router'
 import bodyparser from 'koa-bodyparser'
 import crypto from 'crypto'
 import fs from 'fs'
-import { alistServer, webdavServer, port, initAlistConfig, version } from './config'
+import { alistServer, webdavServer, port, initAlistConfig, initArchiveCacheConfig, version } from './config'
 import { getUserInfo, cacheUserToken, getUserByToken, updateUserInfo } from './dao/userDao'
 import responseHandle from './middleware/responseHandle'
 import { encodeFolderName, decodeFolderName } from './utils/commonUtil'
@@ -100,6 +100,7 @@ router.all('/saveAlistConfig', async (ctx, next) => {
       passwdInfo.encPath = passwdInfo.encPath.split(',')
     }
   }
+  initArchiveCacheConfig({ alistServer: alistConfig })
   const _snapshot = JSON.parse(JSON.stringify(alistConfig))
   // 写入到文件中，这里并不是真正的同步，，
   fs.writeFileSync(process.cwd() + '/conf/config.json', JSON.stringify({ alistServer: _snapshot, webdavServer, port }, '', '\t'))
@@ -121,6 +122,7 @@ router.all('/saveWebdavConfig', async (ctx, next) => {
       passwdInfo.encPath = passwdInfo.encPath.split(',')
     }
   }
+  initArchiveCacheConfig({ webdavServer: [config] })
   config.id = crypto.randomUUID()
   webdavServer.push(config)
   fs.writeFileSync(process.cwd() + '/conf/config.json', JSON.stringify({ alistServer: alistServer._snapshot, webdavServer, port }, '', '\t'))
@@ -135,6 +137,7 @@ router.all('/updateWebdavConfig', async (ctx, next) => {
       passwdInfo.encPath = passwdInfo.encPath.split(',')
     }
   }
+  initArchiveCacheConfig({ webdavServer: [config] })
 
   for (const index in webdavServer) {
     if (webdavServer[index].id === config.id) {

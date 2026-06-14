@@ -3,8 +3,9 @@ const os = require('os')
 const path = require('path')
 const dotenv = require('dotenv')
 const { randomUUID } = require('crypto')
+const fs = require('fs')
 
-const pkgDirPath = path.dirname(process.argv[1])
+const pkgDirPath = process.argv[1] ? path.dirname(process.argv[1]) : process.cwd()
 dotenv.config({ path: pkgDirPath + '/.env' })
 
 const pkgThreadPath = pkgDirPath + '/PRGAThreadCom.js'
@@ -17,26 +18,33 @@ if (isMainThread) {
   // 避免消耗光资源，加一用于后续的预加载RC4的位置
   const workerNum = parseInt(os.cpus().length / 2 + 1)
   const workerList = []
-  for (let i = workerNum; i--; ) {
-    let basePath = pkgThreadPath
-    if (process.env.RUN_MODE === 'DEV') {
-      basePath = threadPath
+  let inited = false
+  const initWorker = function () {
+    if (inited) return
+    inited = true
+    for (let i = workerNum; i--; ) {
+      let basePath = pkgThreadPath
+      if (process.env.RUN_MODE === 'DEV' || !fs.existsSync(pkgThreadPath)) {
+        basePath = threadPath
+      }
+      const worker = new Worker(basePath, {
+        workerData: 'work-name-' + i,
+      })
+      worker.unref && worker.unref()
+      worker._name = 'work-name-' + i
+      workerList[i] = worker
+      worker.on('error', (err) => {
+        console.log('@@worker_error', worker, err)
+      })
+      // Message distribution by msgId
+      worker.on('message', ({ msgId, resData }) => {
+        worker.emit(msgId, resData)
+      })
     }
-    const worker = new Worker(basePath, {
-      workerData: 'work-name-' + i,
-    })
-    worker._name = 'work-name-' + i
-    workerList[i] = worker
-    worker.on('error', (err) => {
-      console.log('@@worker_error', worker, err)
-    })
-    // Message distribution by msgId
-    worker.on('message', ({ msgId, resData }) => {
-      worker.emit(msgId, resData)
-    })
   }
 
   PRGAExcuteThread = function (data) {
+    initWorker()
     return new Promise((resolve, reject) => {
       const worker = workerList[index++ % workerNum]
       const msgId = randomUUID()

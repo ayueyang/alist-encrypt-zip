@@ -5,6 +5,7 @@ import levelDB from './levelDB'
 import path from 'path'
 import { convertShowName, decodeName } from './commonUtil'
 import { applyWinZipAesResponseHeaders, isWinZipAesEncType, serializeWinZipAesZipInfo } from './winZipAesZip'
+import { applySevenZipAesCbcResponseHeaders, isSevenZipAesCbcEncType, serializeSevenZipAesCbcInfo } from './sevenZipAesCbc'
 // import { pathExec } from './commonUtil'
 const Agent = http.Agent
 const Agents = https.Agent
@@ -75,8 +76,9 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
               redirectUrl,
               passwdInfo,
               fileSize,
-              virtualName: request.zipVirtualName,
+              virtualName: request.zipVirtualName || request.sevenZipAesCbcVirtualName,
               zipInfo: serializeWinZipAesZipInfo(request.zipInfo),
+              sevenZipAesCbcInfo: serializeSevenZipAesCbcInfo(request.sevenZipAesCbcInfo),
             },
             60 * 60 * 72
           ) // 缓存起来，默认3天，足够下载和观看了
@@ -92,13 +94,16 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
         response.setHeader(key, httpResp.headers[key])
       }
       applyWinZipAesResponseHeaders(response, request)
+      applySevenZipAesCbcResponseHeaders(response, request)
       // 下载时解密文件名
       if (method === 'GET' && response.statusCode < 300 && passwdInfo && passwdInfo.enable && passwdInfo.encName) {
-        let fileName = request.zipVirtualName || decodeURIComponent(path.basename(url))
-        if (!request.zipVirtualName) {
-          fileName = isWinZipAesEncType(passwdInfo.encType)
-            ? convertShowName(passwdInfo.password, passwdInfo.encType, fileName)
-            : decodeName(passwdInfo.password, passwdInfo.encType, fileName.replace(path.extname(fileName), ''))
+        let fileName = request.zipVirtualName || request.sevenZipAesCbcVirtualName || decodeURIComponent(path.basename(url))
+        if (!request.zipVirtualName && !request.sevenZipAesCbcVirtualName) {
+          fileName = isSevenZipAesCbcEncType(passwdInfo.encType)
+            ? fileName
+            : isWinZipAesEncType(passwdInfo.encType)
+              ? convertShowName(passwdInfo.password, passwdInfo.encType, fileName)
+              : decodeName(passwdInfo.password, passwdInfo.encType, fileName.replace(path.extname(fileName), ''))
         }
         if (fileName) {
           let cd = response.getHeader('content-disposition')
@@ -106,6 +111,13 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
           console.log('解密文件名...', reqId, fileName)
           response.setHeader('content-disposition', cd + `filename*=UTF-8''${encodeURIComponent(fileName)};`)
         }
+      }
+
+      if (String(method).toLocaleUpperCase() === 'HEAD') {
+        httpResp.resume()
+        response.end()
+        resolve()
+        return
       }
 
       httpResp
@@ -122,6 +134,7 @@ export async function httpProxy(request, response, encryptTransform, decryptTran
     })
     httpReq.on('error', (err) => {
       console.log('@@httpProxy request error ', reqId, err, urlAddr, headers)
+      reject(err)
     })
     // 是否需要加密
     if (request.followRemoteRedirect && ['GET', 'HEAD'].includes(String(method).toLocaleUpperCase())) {
@@ -170,6 +183,7 @@ export async function httpClient(request, response) {
     })
     httpReq.on('error', (err) => {
       console.log('@@httpClient request error ', err)
+      reject(err)
     })
     // check request type
     if (!reqBody) {

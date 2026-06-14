@@ -4,6 +4,7 @@ import MixEnc from './mixEnc'
 import Rc4Md5 from './rc4Md5'
 import AesCTR from './aesCTR'
 import WinZipAesZip, { isWinZipAesEncType } from './winZipAesZip'
+import SevenZipAesCbc, { isSevenZipAesCbcEncType } from './sevenZipAesCbc'
 
 const cachePasswdOutward = {}
 
@@ -28,6 +29,10 @@ class FlowEnc {
     }
     if (isWinZipAesEncType(encryptType)) {
       encryptFlow = new WinZipAesZip(password, fileSize, options)
+      this.passwdOutward = encryptFlow.passwdOutward
+    }
+    if (isSevenZipAesCbcEncType(encryptType)) {
+      encryptFlow = new SevenZipAesCbc(password, fileSize, options)
       this.passwdOutward = encryptFlow.passwdOutward
     }
     if (encryptFlow === null) {

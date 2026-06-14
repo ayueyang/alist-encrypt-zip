@@ -16,9 +16,21 @@ import path from 'path'
 import { httpClient, httpProxy } from './utils/httpClient'
 import FlowEnc from './utils/flowEnc'
 import { logger } from './common/logger'
-import { cacheFileInfo, getFileInfo } from './dao/fileDao'
+import { getFileInfo } from './dao/fileDao'
 import WinZipAesZip, { isWinZipAesEncType } from './utils/winZipAesZip'
 import { enqueueExternalWinZipAesZipProbe } from './utils/winZipAesZipCache'
+import SevenZipAesCbc, {
+  getSevenZipAesCbcPackageName,
+  isSevenZipAesCbcEncType,
+} from './utils/sevenZipAesCbc'
+import {
+  cacheGeneratedSevenZipAesCbcInfo,
+  enqueueExternalSevenZipAesCbcProbe,
+  getSevenZipAesCbcCachedFileInfoByVirtualPath,
+  getSevenZipAesCbcUploadCachePaths,
+  isSevenZipAesCbcFileName,
+  isUsableSevenZipAesCbcInfoCache,
+} from './utils/sevenZipAesCbcCache'
 
 // bodyparser解析body
 const bodyparserMw = bodyparser({ enableTypes: ['json', 'form', 'text'] })
@@ -44,6 +56,28 @@ async function getCachedFileInfoByPath(filePath) {
   return (await getFileInfo(encodeURIComponent(filePath))) || (await getFileInfo(filePath))
 }
 
+async function getCachedSevenZipAesCbcFileInfoByPath(filePath, passwdInfo) {
+  return (
+    (await getSevenZipAesCbcCachedFileInfoByVirtualPath(filePath, passwdInfo.password)) ||
+    (await getCachedFileInfoByPath(filePath))
+  )
+}
+
+function getSevenZipAesCbcCachedPackageName(fileInfo, fallbackName) {
+  return (
+    (fileInfo &&
+      (fileInfo.sevenZipAesCbcPackageName ||
+        path.basename(fileInfo.sevenZipAesCbcPackagePath || '') ||
+        (isSevenZipAesCbcFileName(fileInfo.name) ? fileInfo.name : ''))) ||
+    fallbackName
+  )
+}
+
+async function getSevenZipAesCbcRequestPackageName(dir, name, passwdInfo) {
+  const cachedFileInfo = await getCachedSevenZipAesCbcFileInfoByPath(joinUrlPath(dir, name), passwdInfo)
+  return getSevenZipAesCbcCachedPackageName(cachedFileInfo, name)
+}
+
 function isRawZipName(passwdInfo, fileName) {
   return (
     isWinZipAesEncType(passwdInfo.encType) &&
@@ -52,21 +86,34 @@ function isRawZipName(passwdInfo, fileName) {
   )
 }
 
+function isRawSevenZipAesCbcName(passwdInfo, fileName) {
+  return isSevenZipAesCbcEncType(passwdInfo.encType) && isSevenZipAesCbcFileName(fileName)
+}
+
 function getRequestRealName(passwdInfo, fileName, fileInfo) {
-  if (fileInfo && fileInfo.externalZip) {
+  if (isSevenZipAesCbcEncType(passwdInfo.encType)) {
+    return getSevenZipAesCbcCachedPackageName(fileInfo, fileName)
+  }
+  if (fileInfo && (fileInfo.externalZip || fileInfo.externalSevenZipAesCbc)) {
     return fileInfo.name || fileName
   }
-  if (isRawZipName(passwdInfo, fileName)) {
+  if (isRawZipName(passwdInfo, fileName) || isRawSevenZipAesCbcName(passwdInfo, fileName)) {
     return fileName
   }
   return isOrigName(fileName) ? getOrigName(fileName) : convertRealName(passwdInfo.password, passwdInfo.encType, fileName)
 }
 
 function getShowName(passwdInfo, rawName, fileInfo) {
-  if (fileInfo && fileInfo.externalZip) {
+  if (isSevenZipAesCbcEncType(passwdInfo.encType)) {
+    if (fileInfo && fileInfo.externalSevenZipAesCbc && fileInfo.sevenZipAesCbcInfo) {
+      return fileInfo.sevenZipAesCbcInfo.innerName || fileInfo.sevenZipAesCbcVirtualName || rawName
+    }
     return rawName
   }
-  if (isRawZipName(passwdInfo, rawName)) {
+  if (fileInfo && (fileInfo.externalZip || fileInfo.externalSevenZipAesCbc)) {
+    return rawName
+  }
+  if (isRawZipName(passwdInfo, rawName) || isRawSevenZipAesCbcName(passwdInfo, rawName)) {
     return rawName
   }
   return convertShowName(passwdInfo.password, passwdInfo.encType, rawName)
@@ -84,6 +131,13 @@ function joinUrlPath(dir, name) {
   return `${String(dir || '').replace(/\/$/, '')}/${name}`
 }
 
+function getSevenZipAesCbcProbeUrl(fileInfo, request) {
+  if (fileInfo.sign) {
+    return `${request.serverAddr}/p${encodeURI(fileInfo.path)}?sign=${encodeURIComponent(fileInfo.sign)}`
+  }
+  return request.serverAddr + fileInfo.path
+}
+
 function prepareWinZipAesListFileInfo(fileInfo, request, passwdInfo) {
   if (!isWinZipAesEncType(passwdInfo.encType) || fileInfo.is_dir || !String(fileInfo.name || '').toLowerCase().endsWith('.zip')) {
     return fileInfo
@@ -99,6 +153,38 @@ function prepareWinZipAesListFileInfo(fileInfo, request, passwdInfo) {
       fileInfo,
       urlAddr: request.serverAddr + fileInfo.path,
       headers: request.headers,
+      passwdInfo,
+    })
+  }
+  return fileInfo
+}
+
+async function prepareSevenZipAesCbcListFileInfo(fileInfo, request, passwdInfo) {
+  if (!isSevenZipAesCbcEncType(passwdInfo.encType) || fileInfo.is_dir || !isSevenZipAesCbcFileName(fileInfo.name)) {
+    return fileInfo
+  }
+  const cachedFileInfo = await getCachedFileInfoByPath(fileInfo.path)
+  if (isUsableSevenZipAesCbcInfoCache(cachedFileInfo, fileInfo.size, passwdInfo.password)) {
+    const sevenZipAesCbcInnerName = cachedFileInfo.sevenZipAesCbcInfo.innerName
+    const sevenZipAesCbcPackagePath = cachedFileInfo.sevenZipAesCbcPackagePath || fileInfo.path
+    fileInfo.plainSize = cachedFileInfo.plainSize
+    fileInfo.sevenZipAesCbcInfo = cachedFileInfo.sevenZipAesCbcInfo
+    fileInfo.externalSevenZipAesCbc = cachedFileInfo.externalSevenZipAesCbc
+    fileInfo.sevenZipAesCbcVirtualName = sevenZipAesCbcInnerName
+    fileInfo.sevenZipAesCbcPackageName = cachedFileInfo.sevenZipAesCbcPackageName || fileInfo.name
+    fileInfo.sevenZipAesCbcPackagePath = sevenZipAesCbcPackagePath
+    fileInfo.name = sevenZipAesCbcInnerName
+    fileInfo.path = joinUrlPath(path.dirname(sevenZipAesCbcPackagePath), sevenZipAesCbcInnerName)
+    fileInfo.size = cachedFileInfo.plainSize || fileInfo.size
+    fileInfo.type = getAListFileTypeByName(sevenZipAesCbcInnerName)
+    return fileInfo
+  }
+  if (passwdInfo.sevenZipAesCbcAutoCache) {
+    enqueueExternalSevenZipAesCbcProbe({
+      fileInfo,
+      urlAddr: getSevenZipAesCbcProbeUrl(fileInfo, request),
+      headers: request.headers,
+      passwdInfo,
     })
   }
   return fileInfo
@@ -125,7 +211,8 @@ encNameRouter.all('/api/fs/list', async (ctx, next) => {
       const { passwdInfo } = pathFindPasswd(passwdList, decodeURI(fileInfo.path))
       if (passwdInfo && passwdInfo.encName) {
         prepareWinZipAesListFileInfo(fileInfo, ctx.req, passwdInfo)
-        if (!isWinZipAesEncType(passwdInfo.encType)) {
+        await prepareSevenZipAesCbcListFileInfo(fileInfo, ctx.req, passwdInfo)
+        if (!isWinZipAesEncType(passwdInfo.encType) && !isSevenZipAesCbcEncType(passwdInfo.encType)) {
           fileInfo.name = convertShowName(passwdInfo.password, passwdInfo.encType, fileInfo.name)
         }
       }
@@ -168,18 +255,40 @@ encNameRouter.put('/api/fs/put', async (ctx, next) => {
   const { passwdInfo } = pathFindPasswd(webdavConfig.passwdList, uploadPath)
   if (passwdInfo) {
     const fileName = path.basename(uploadPath)
+    let realName = fileName
+    let filePath = uploadPath
+    let packageSize = request.fileSize
     // you can custom Suffix
-    if (passwdInfo.encName) {
-      const realName = getEncryptedFileName(passwdInfo, fileName)
-      const filePath = path.dirname(uploadPath) + '/' + realName
+    if (isSevenZipAesCbcEncType(passwdInfo.encType) || passwdInfo.encName) {
+      realName = isSevenZipAesCbcEncType(passwdInfo.encType)
+        ? getSevenZipAesCbcPackageName(fileName)
+        : getEncryptedFileName(passwdInfo, fileName)
+      filePath = path.dirname(uploadPath) + '/' + realName
       console.log('@@@encfileName', fileName, uploadPath, filePath)
       headers['file-path'] = encodeURIComponent(filePath)
     }
     if (isWinZipAesEncType(passwdInfo.encType)) {
-      const packageSize = WinZipAesZip.packageSize(request.fileSize, { originalName: fileName })
+      packageSize = WinZipAesZip.packageSize(request.fileSize, { originalName: fileName })
+      headers['content-length'] = String(packageSize)
+    } else if (isSevenZipAesCbcEncType(passwdInfo.encType)) {
+      packageSize = SevenZipAesCbc.packageSize(request.fileSize, { originalName: fileName })
       headers['content-length'] = String(packageSize)
     }
     const flowEnc = new FlowEnc(passwdInfo.password, passwdInfo.encType, request.fileSize, { originalName: fileName })
+    if (isSevenZipAesCbcEncType(passwdInfo.encType)) {
+      for (const cachePath of getSevenZipAesCbcUploadCachePaths(filePath)) {
+        await cacheGeneratedSevenZipAesCbcInfo({
+          password: passwdInfo.password,
+          filePath: cachePath,
+          realName: path.basename(cachePath),
+          originalName: fileName,
+          plainSize: request.fileSize,
+          packageSize,
+          iv: flowEnc.encryptFlow.iv,
+          passwdInfo,
+        })
+      }
+    }
     return await httpProxy(ctx.req, ctx.res, flowEnc.encryptTransform())
   }
   return await httpProxy(ctx.req, ctx.res)
@@ -191,10 +300,16 @@ encNameRouter.all('/api/fs/remove', bodyparserMw, async (ctx, next) => {
   const { webdavConfig } = ctx.req
   const { passwdInfo } = pathFindPasswd(webdavConfig.passwdList, dir)
   // maybe a folder，remove anyway the name
-  const fileNames = Object.assign([], names)
-  if (passwdInfo && passwdInfo.encName) {
+  let fileNames = Object.assign([], names)
+  if (passwdInfo && passwdInfo.encName && isSevenZipAesCbcEncType(passwdInfo.encType)) {
+    fileNames = []
     for (const name of names) {
-      if (isRawZipName(passwdInfo, name)) {
+      fileNames.push(await getSevenZipAesCbcRequestPackageName(dir, name, passwdInfo))
+    }
+  } else if (passwdInfo && passwdInfo.encName && !isSevenZipAesCbcEncType(passwdInfo.encType)) {
+    fileNames = Object.assign([], names)
+    for (const name of names) {
+      if (isRawZipName(passwdInfo, name) || isRawSevenZipAesCbcName(passwdInfo, name)) {
         continue
       }
       // is not enc name
@@ -216,7 +331,12 @@ const copyOrMoveFile = async (ctx, next) => {
   const { webdavConfig } = ctx.req
   const { passwdInfo } = pathFindPasswd(webdavConfig.passwdList, srcDir)
   let fileNames = []
-  if (passwdInfo && passwdInfo.encName) {
+  if (passwdInfo && passwdInfo.encName && isSevenZipAesCbcEncType(passwdInfo.encType)) {
+    logger.info('@@move 7z AES-CBC name', passwdInfo.encName)
+    for (const name of names) {
+      fileNames.push(await getSevenZipAesCbcRequestPackageName(srcDir, name, passwdInfo))
+    }
+  } else if (passwdInfo && passwdInfo.encName && !isSevenZipAesCbcEncType(passwdInfo.encType)) {
     logger.info('@@move encName', passwdInfo.encName)
     for (const name of names) {
       // is not enc name
@@ -226,7 +346,11 @@ const copyOrMoveFile = async (ctx, next) => {
         break
       }
       const cachedFileInfo = await getCachedFileInfoByPath(joinUrlPath(srcDir, name))
-      if ((cachedFileInfo && cachedFileInfo.externalZip) || isRawZipName(passwdInfo, name)) {
+      if (
+        (cachedFileInfo && (cachedFileInfo.externalZip || cachedFileInfo.externalSevenZipAesCbc)) ||
+        isRawZipName(passwdInfo, name) ||
+        isRawSevenZipAesCbcName(passwdInfo, name)
+      ) {
         fileNames.push(name)
         continue
       }
@@ -259,7 +383,9 @@ encNameRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     delete ctx.req.headers['content-length']
     // check fileName is not enc
     const fileName = path.basename(filePath)
-    fileInfo = await getCachedFileInfoByPath(filePath)
+    fileInfo = isSevenZipAesCbcEncType(passwdInfo.encType)
+      ? await getCachedSevenZipAesCbcFileInfoByPath(filePath, passwdInfo)
+      : await getCachedFileInfoByPath(filePath)
     if (fileInfo && fileInfo.is_dir) {
       await next()
       return
@@ -270,6 +396,19 @@ encNameRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
       if (ctx.req.isExternalZip && fileInfo.zipInfo) {
         ctx.req.zipVirtualName = fileInfo.zipInfo.innerName
         ctx.req.cachedExternalZipInfo = fileInfo.zipInfo
+      }
+    }
+    if (isSevenZipAesCbcEncType(passwdInfo.encType)) {
+      ctx.req.isExternalSevenZipAesCbc = !!(
+        fileInfo &&
+        fileInfo.externalSevenZipAesCbc &&
+        isUsableSevenZipAesCbcInfoCache(fileInfo, fileInfo.size, passwdInfo.password)
+      )
+      ctx.req.isExternalSevenZipAesCbcCandidate =
+        !ctx.req.isExternalSevenZipAesCbc && isSevenZipAesCbcFileName(fileName)
+      if (ctx.req.isExternalSevenZipAesCbc && fileInfo.sevenZipAesCbcInfo) {
+        ctx.req.sevenZipAesCbcVirtualName = fileInfo.sevenZipAesCbcInfo.innerName
+        ctx.req.cachedExternalSevenZipAesCbcInfo = fileInfo.sevenZipAesCbcInfo
       }
     }
     //  Check if it is a directory
@@ -285,7 +424,9 @@ encNameRouter.all('/api/fs/get', bodyparserMw, async (ctx, next) => {
     ctx.body.data.name = showName
     if (fileInfo && fileInfo.externalZip && fileInfo.zipInfo) {
       ctx.body.data.type = getAListFileTypeByName(fileInfo.zipInfo.innerName)
-    } else if (!ctx.req.isExternalZipCandidate) {
+    } else if (fileInfo && fileInfo.externalSevenZipAesCbc && fileInfo.sevenZipAesCbcInfo) {
+      ctx.body.data.type = getAListFileTypeByName(fileInfo.sevenZipAesCbcInfo.innerName)
+    } else if (!ctx.req.isExternalZipCandidate && !ctx.req.isExternalSevenZipAesCbcCandidate) {
       ctx.body.data.type = getAListFileTypeByName(showName)
     }
   }
@@ -300,14 +441,22 @@ encNameRouter.all('/api/fs/rename', bodyparserMw, async (ctx, next) => {
   // reset content-length length
   delete ctx.req.headers['content-length']
 
-  let fileInfo = await getCachedFileInfoByPath(filePath)
+  let fileInfo =
+    passwdInfo && isSevenZipAesCbcEncType(passwdInfo.encType)
+      ? await getCachedSevenZipAesCbcFileInfoByPath(filePath, passwdInfo)
+      : await getCachedFileInfoByPath(filePath)
   if (fileInfo == null && passwdInfo && passwdInfo.encName) {
     // mabay a file
     const realName = convertRealName(passwdInfo.password, passwdInfo.encType, filePath)
     const realFilePath = path.dirname(filePath) + '/' + realName
     fileInfo = await getCachedFileInfoByPath(realFilePath)
   }
-  if (passwdInfo && passwdInfo.encName && fileInfo && !fileInfo.is_dir) {
+  if (passwdInfo && passwdInfo.encName && fileInfo && !fileInfo.is_dir && isSevenZipAesCbcEncType(passwdInfo.encType)) {
+    const realName = getSevenZipAesCbcCachedPackageName(fileInfo, path.basename(filePath))
+    const fpath = path.dirname(filePath) + '/' + realName
+    reqBody.path = fpath
+    reqBody.name = getSevenZipAesCbcPackageName(name)
+  } else if (passwdInfo && passwdInfo.encName && fileInfo && !fileInfo.is_dir && !isSevenZipAesCbcEncType(passwdInfo.encType)) {
     // reset content-length length
     // you can custom Suffix
     const realName = fileInfo.externalZip
@@ -344,7 +493,9 @@ const handleDownload = async (ctx, next) => {
     delete ctx.req.headers['content-length']
     // Check whether the file name refers to an encrypted file or a directory
     const fileName = path.basename(filePath)
-    const fileInfo = await getCachedFileInfoByPath(filePath)
+    const fileInfo = isSevenZipAesCbcEncType(passwdInfo.encType)
+      ? await getCachedSevenZipAesCbcFileInfoByPath(filePath, passwdInfo)
+      : await getCachedFileInfoByPath(filePath)
     const realName = getRequestRealName(passwdInfo, fileName, fileInfo)
     // Replace the real-name before downloading
     ctx.req.url = ctx.req.url.replace(regexPath, `/${realName}$2`)

@@ -33,10 +33,13 @@ const alistServerTemp = {
     {
       password: '123456',
       describe: 'my video', // 加密内容描述
-      encType: 'aesctr', // 算法类型，可选mix，rc4，winzip-aes-ctr，默认aesctr
+      encType: 'aesctr', // 算法类型，可选mix，rc4，winzip-aes-ctr，7z-aes-cbc，默认aesctr
       enable: true, // enable encrypt
       encName: false, // encrypt file name
+      zipInfoCache: true, // cache parsed archive fields for playback
+      zipInfoCacheDays: 30, // archive info cache TTL, days
       zipAutoCache: false, // auto probe external WinZip AES ZIP in background
+      sevenZipAesCbcAutoCache: false, // auto probe external 7z AES-CBC in background
       encSuffix: '', //
       encPath: ['encrypt_folder/*', 'movie_encrypt/*'], // 路径支持正则表达式，常用的就是 尾巴带*，此目录的所文件都加密
     },
@@ -57,11 +60,15 @@ const webdavServerTemp = [
     passwdList: [
       {
         password: '123456',
-        encType: 'aesctr', // 密码类型，mix：速度更快适合电视盒子之类，rc4: 更安全，速度比mix慢一点，几乎无感知。winzip-aes-ctr: 标准WinZip AES压缩包。
+        // 密码类型，mix：速度更快适合电视盒子之类，rc4: 更安全，速度比mix慢一点，几乎无感知。winzip-aes-ctr: 标准WinZip AES压缩包。
+        encType: 'aesctr', // 7z-aes-cbc: 7z AES-CBC实验验证。
         describe: 'my video',
         enable: false,
         encName: false, // encrypt file name
+        zipInfoCache: true, // cache parsed archive fields for playback
+        zipInfoCacheDays: 30, // archive info cache TTL, days
         zipAutoCache: false, // auto probe external WinZip AES ZIP in background
+        sevenZipAesCbcAutoCache: false, // auto probe external 7z AES-CBC in background
         encNameSuffix: '', //
         encPath: ['encrypt_folder/*', '/dav/189cloud/*'], // 子路径
       },
@@ -84,6 +91,38 @@ if (!exist) {
 const configJson = fs.readFileSync(getConfFilePath(), 'utf8')
 const configData = JSON.parse(configJson)
 
+function initPasswdConfig(passwdInfo) {
+  if (passwdInfo.zipInfoCache === undefined) {
+    passwdInfo.zipInfoCache = true
+  }
+  if (!Number(passwdInfo.zipInfoCacheDays)) {
+    passwdInfo.zipInfoCacheDays = 30
+  }
+  if (passwdInfo.zipAutoCache === undefined) {
+    passwdInfo.zipAutoCache = false
+  }
+  if (passwdInfo.sevenZipAesCbcAutoCache === undefined) {
+    passwdInfo.sevenZipAesCbcAutoCache = false
+  }
+}
+
+export function initArchiveCacheConfig(config) {
+  if (config && config.alistServer && config.alistServer.passwdList) {
+    for (const passwdInfo of config.alistServer.passwdList) {
+      initPasswdConfig(passwdInfo)
+    }
+  }
+  if (config && config.webdavServer) {
+    for (const webdavConfig of config.webdavServer) {
+      for (const passwdInfo of webdavConfig.passwdList || []) {
+        initPasswdConfig(passwdInfo)
+      }
+    }
+  }
+}
+
+initArchiveCacheConfig(configData)
+
 // 兼容之前的数据进来，保留2个版
 if (configData.alistServer.flowPassword) {
   const alistServer = configData.alistServer
@@ -98,6 +137,7 @@ if (configData.alistServer.flowPassword) {
   delete alistServer.encPath
   configData.webdavServer = webdavServerTemp
   fs.writeFileSync(process.cwd() + '/conf/config.json', JSON.stringify(configData, '', '\t'))
+  initArchiveCacheConfig(configData)
 }
 
 /** 初始化用户的数据库 */

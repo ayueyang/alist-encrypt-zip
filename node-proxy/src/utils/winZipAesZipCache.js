@@ -1,5 +1,5 @@
 import path from 'path'
-import { cacheFileInfo, getFileInfo } from '../dao/fileDao'
+import { cacheFileInfo, getFileInfo, getZipInfoCacheExpireSeconds, isZipInfoCacheEnabled } from '../dao/fileDao'
 import levelDB from './levelDB'
 import {
   isWinZipAesEncType,
@@ -42,9 +42,9 @@ export function isUsableWinZipAesZipNegativeCache(probeInfo, size) {
   )
 }
 
-export async function getWinZipAesZipProbeCache(filePath, size) {
+export async function getWinZipAesZipProbeCache(filePath, size, options = {}) {
   const cachedFileInfo = (await getFileInfo(filePath)) || (await getFileInfo(encodeURIComponent(filePath)))
-  if (isUsableWinZipAesZipInfoCache(cachedFileInfo, size)) {
+  if (!options.ignoreInfoCache && isUsableWinZipAesZipInfoCache(cachedFileInfo, size)) {
     return { type: 'hit', fileInfo: cachedFileInfo }
   }
   const negativeProbe = await levelDB.getValue(probeKey(filePath))
@@ -54,7 +54,7 @@ export async function getWinZipAesZipProbeCache(filePath, size) {
   return { type: 'miss', fileInfo: cachedFileInfo }
 }
 
-export async function cacheExternalWinZipAesZipInfo(fileInfo, zipInfo) {
+export async function cacheExternalWinZipAesZipInfo(fileInfo, zipInfo, passwdInfo) {
   const nextFileInfo = {
     ...fileInfo,
     path: normalizePath(fileInfo.path),
@@ -65,7 +65,24 @@ export async function cacheExternalWinZipAesZipInfo(fileInfo, zipInfo) {
     externalZip: true,
     zipVirtualName: fileInfo.zipVirtualName || fileInfo.name || path.basename(fileInfo.path),
   }
-  await cacheFileInfo(nextFileInfo)
+  if (!isZipInfoCacheEnabled(passwdInfo)) return nextFileInfo
+  await cacheFileInfo(nextFileInfo, getZipInfoCacheExpireSeconds(passwdInfo))
+  return nextFileInfo
+}
+
+export async function cacheManagedWinZipAesZipInfo(fileInfo, zipInfo, passwdInfo) {
+  const nextFileInfo = {
+    ...fileInfo,
+    path: normalizePath(fileInfo.path),
+    name: fileInfo.name || path.basename(fileInfo.path),
+    size: normalizeSize(fileInfo.size),
+    plainSize: zipInfo.plainSize,
+    zipInfo: serializeWinZipAesZipInfo(zipInfo),
+    externalZip: false,
+    zipVirtualName: fileInfo.zipVirtualName,
+  }
+  if (!isZipInfoCacheEnabled(passwdInfo)) return nextFileInfo
+  await cacheFileInfo(nextFileInfo, getZipInfoCacheExpireSeconds(passwdInfo))
   return nextFileInfo
 }
 
@@ -91,10 +108,12 @@ async function processQueue() {
       const job = probeQueue.shift()
       const key = normalizePath(job.fileInfo.path)
       try {
-        const cached = await getWinZipAesZipProbeCache(job.fileInfo.path, job.fileInfo.size)
+        const cached = await getWinZipAesZipProbeCache(job.fileInfo.path, job.fileInfo.size, {
+          ignoreInfoCache: !isZipInfoCacheEnabled(job.passwdInfo),
+        })
         if (cached.type === 'miss') {
           const zipInfo = await parseWinZipAesZipInfoFromRemote(job.urlAddr, job.headers, job.fileInfo.size)
-          await cacheExternalWinZipAesZipInfo(job.fileInfo, zipInfo)
+          await cacheExternalWinZipAesZipInfo(job.fileInfo, zipInfo, job.passwdInfo)
         }
       } catch (e) {
         await cacheExternalWinZipAesZipNegative(job.fileInfo, e)
@@ -107,7 +126,7 @@ async function processQueue() {
   }
 }
 
-export function enqueueExternalWinZipAesZipProbe({ fileInfo, urlAddr, headers }) {
+export function enqueueExternalWinZipAesZipProbe({ fileInfo, urlAddr, headers, passwdInfo }) {
   if (!fileInfo || fileInfo.is_dir || !String(fileInfo.name || '').toLowerCase().endsWith('.zip')) {
     return false
   }
@@ -124,6 +143,7 @@ export function enqueueExternalWinZipAesZipProbe({ fileInfo, urlAddr, headers })
     },
     urlAddr,
     headers: { ...(headers || {}) },
+    passwdInfo,
   })
   setTimeout(processQueue, 0)
   return true

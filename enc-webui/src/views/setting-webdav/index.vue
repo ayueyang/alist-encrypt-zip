@@ -34,6 +34,7 @@
               <el-radio label="rc4" border>RC4</el-radio>
               <el-radio label="aesctr" border>AES-CTR(新)</el-radio>
               <el-radio label="winzip-aes-ctr" border>WinZip-AES-CTR</el-radio>
+              <el-radio label="7z-aes-cbc" border>7z AES-CBC</el-radio>
             </el-radio-group>
             开启
             <el-switch v-model="item.enable" class="ml-2" style="--el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949" />
@@ -55,6 +56,24 @@
               自动
               <el-switch
                 v-model="item.zipAutoCache"
+                class="ml-2"
+                style="margin-right: 10px; --el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949"
+              />
+            </el-form-item>
+            <el-form-item v-if="item.encType === 'winzip-aes-ctr' || item.encType === '7z-aes-cbc'" label="包信息缓存">
+              开启
+              <el-switch
+                v-model="item.zipInfoCache"
+                class="ml-2"
+                style="margin-right: 10px; --el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949"
+              />
+              <el-input v-model="item.zipInfoCacheDays" style="max-width: 90px; margin-right: 8px" placeholder="30" />
+              天
+            </el-form-item>
+            <el-form-item v-if="item.encType === '7z-aes-cbc'" label="7z AES-CBC缓存">
+              自动
+              <el-switch
+                v-model="item.sevenZipAesCbcAutoCache"
                 class="ml-2"
                 style="margin-right: 10px; --el-switch-on-color: #13ce66; --el-switch-off-color: #ff4949"
               />
@@ -128,7 +147,10 @@ const configTemp = {
       encType: 'aesctr',
       enable: false,
       encName: false, // encrypt file name
+      zipInfoCache: true,
+      zipInfoCacheDays: 30,
       zipAutoCache: false,
+      sevenZipAesCbcAutoCache: false,
       encSuffix: '', //
       describe: 'my video',
       encPath: '/aliyun/encrypt/*'
@@ -145,7 +167,10 @@ const addPasswd = () => {
     password: '123456',
     encType: 'aesctr',
     enable: true,
+    zipInfoCache: true,
+    zipInfoCacheDays: 30,
     zipAutoCache: false,
+    sevenZipAesCbcAutoCache: false,
     describe: 'my video',
     encPath: '/dav/encrypt/*'
   })
@@ -200,6 +225,10 @@ const refreshConfigList = async (result) => {
     const passwdList = element.passwdList
     for (const passwdInfo of passwdList) {
       passwdInfo.id = Math.random()
+      if (passwdInfo.zipInfoCache === undefined) passwdInfo.zipInfoCache = true
+      if (!passwdInfo.zipInfoCacheDays) passwdInfo.zipInfoCacheDays = 30
+      if (passwdInfo.zipAutoCache === undefined) passwdInfo.zipAutoCache = false
+      if (passwdInfo.sevenZipAesCbcAutoCache === undefined) passwdInfo.sevenZipAesCbcAutoCache = false
       // passwdInfo.encPath = passwdInfo.encPath.reduce((a, b) => `${a},${b}`)
     }
     configList.push(element)
